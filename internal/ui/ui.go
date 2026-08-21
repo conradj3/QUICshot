@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -873,11 +874,14 @@ func (s *Server) resetFlow() {
 // ---------------------------------------------------------------- API handlers
 
 type stackReq struct {
-	Action        string `json:"action"`
-	OriginTimeout string `json:"originTimeout"`
-	MaxIdle       string `json:"maxIdle"`
-	KeepAlive     string `json:"keepAlive"`
-	Connectors    int    `json:"connectors"`
+	Action          string `json:"action"`
+	OriginTimeout   string `json:"originTimeout"`
+	MaxIdle         string `json:"maxIdle"`
+	KeepAlive       string `json:"keepAlive"`
+	TunnelMaxIdle   string `json:"tunnelMaxIdle"`
+	TunnelKeepAlive string `json:"tunnelKeepAlive"`
+	TunnelLB        string `json:"tunnelLB"`
+	Connectors      int    `json:"connectors"`
 }
 
 func (s *Server) handleStack(w http.ResponseWriter, r *http.Request) {
@@ -909,9 +913,11 @@ func (s *Server) handleStack(w http.ResponseWriter, r *http.Request) {
 func stackCommand(req stackReq) ([]string, []string, error) {
 	env := []string{}
 	for k, v := range map[string]string{
-		"EDGE_ORIGIN_TIMEOUT": req.OriginTimeout,
-		"EDGE_MAX_IDLE":       req.MaxIdle,
-		"EDGE_KEEPALIVE":      req.KeepAlive,
+		"EDGE_ORIGIN_TIMEOUT":   req.OriginTimeout,
+		"EDGE_MAX_IDLE":         req.MaxIdle,
+		"EDGE_KEEPALIVE":        req.KeepAlive,
+		"EDGE_TUNNEL_MAX_IDLE":  req.TunnelMaxIdle,
+		"EDGE_TUNNEL_KEEPALIVE": req.TunnelKeepAlive,
 	} {
 		if v != "" {
 			if !durationRE.MatchString(v) {
@@ -919,6 +925,12 @@ func stackCommand(req stackReq) ([]string, []string, error) {
 			}
 			env = append(env, k+"="+v)
 		}
+	}
+	if req.TunnelLB != "" {
+		if req.TunnelLB != "rr" && req.TunnelLB != "hash" {
+			return nil, nil, errors.New("tunnelLB must be rr or hash")
+		}
+		env = append(env, "EDGE_TUNNEL_LB="+req.TunnelLB)
 	}
 
 	var args []string
@@ -1043,20 +1055,27 @@ func netemModeArgs(req impairReq) []string {
 }
 
 type runReq struct {
-	Tool       string   `json:"tool"` // blast | probe
-	Runner     string   `json:"runner"`
-	URL        string   `json:"url"`
-	Conns      int      `json:"conns"`
-	Workers    int      `json:"workers"`
-	Duration   string   `json:"duration"`
-	Timeout    string   `json:"timeout"`
-	KeepAlive  string   `json:"keepAlive"`
-	MaxIdle    string   `json:"maxIdle"`
-	RPS        float64  `json:"rps"`
-	ReadBody   bool     `json:"readBody"`
-	Insecure   bool     `json:"insecure"`
-	LocalCerts bool     `json:"localCerts"`
-	Headers    []string `json:"headers"`
+	Tool        string   `json:"tool"` // blast | probe | curl | chrome
+	Runner      string   `json:"runner"`
+	URL         string   `json:"url"`
+	Conns       int      `json:"conns"`
+	Workers     int      `json:"workers"`
+	Duration    string   `json:"duration"`
+	Timeout     string   `json:"timeout"`
+	KeepAlive   string   `json:"keepAlive"`
+	MaxIdle     string   `json:"maxIdle"`
+	RPS         float64  `json:"rps"`
+	ReadBody    bool     `json:"readBody"`
+	Insecure    bool     `json:"insecure"`
+	LocalCerts  bool     `json:"localCerts"`
+	Headers     []string `json:"headers"`
+	Mode        string   `json:"mode"`
+	Warmup      string   `json:"warmup"`
+	MaxInflight int      `json:"maxInflight"`
+	Method      string   `json:"method"`
+	Body        string   `json:"body"`
+	URLs        string   `json:"urls"`
+	Probe0RTT   bool     `json:"probe0rtt"`
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
@@ -1072,6 +1091,26 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateRunRequest(req); err != nil {
 		httpErr(w, err)
+		return
+	}
+
+	if req.Tool == "curl" || req.Tool == "chrome" {
+		script := filepath.Join(s.dir, "scripts", "h3-clients.sh")
+		argv := []string{req.Tool, target}
+		if req.Insecure || req.LocalCerts {
+			argv = append(argv, "--insecure")
+		}
+		err = s.start(req.Tool, func(ctx context.Context) {
+			s.log("ui", "$ "+script+" "+strings.Join(argv, " "))
+			if err := s.runStreaming(ctx, req.Tool, nil, script, argv...); err != nil {
+				s.log(req.Tool, "exit: "+err.Error())
+			}
+		})
+		if err != nil {
+			httpErr(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -1100,8 +1139,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateRunRequest(req runReq) error {
-	if req.Tool != "blast" && req.Tool != "probe" {
-		return errors.New("tool must be blast or probe")
+	switch req.Tool {
+	case "blast", "probe", "curl", "chrome":
+	default:
+		return errors.New("tool must be blast, probe, curl, or chrome")
 	}
 	for _, h := range req.Headers {
 		if h == "" {
@@ -1144,6 +1185,7 @@ func appendBlastArgs(args []string, req runReq) ([]string, error) {
 		{"-timeout=", req.Timeout},
 		{"-keepalive=", req.KeepAlive},
 		{"-max-idle-timeout=", req.MaxIdle},
+		{"-warmup=", req.Warmup},
 	}
 	for _, kv := range blastDurations {
 		if kv[1] == "" {
@@ -1162,6 +1204,24 @@ func appendBlastArgs(args []string, req runReq) ([]string, error) {
 	)
 	if req.RPS > 0 {
 		args = append(args, "-rps="+strconv.FormatFloat(req.RPS, 'f', -1, 64))
+	}
+	if req.Mode == "open" || req.Mode == "closed" {
+		args = append(args, "-mode="+req.Mode)
+	}
+	if req.MaxInflight > 0 {
+		args = append(args, "-max-inflight="+strconv.Itoa(clamp(req.MaxInflight, 1, 4096)))
+	}
+	if req.Method != "" {
+		args = append(args, "-method="+req.Method)
+	}
+	if req.Body != "" {
+		args = append(args, "-body="+req.Body)
+	}
+	if req.URLs != "" {
+		args = append(args, "-urls="+req.URLs)
+	}
+	if req.Probe0RTT {
+		args = append(args, "-probe-0rtt")
 	}
 	return args, nil
 }
