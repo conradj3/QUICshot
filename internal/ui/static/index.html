@@ -370,6 +370,8 @@
       <button data-preset="echo"  title="POST echo. Pair with a request body.">/echo</button>
       <button data-preset="headers" title="Large response headers. QPACK / header-block stress.">/headers</button>
       <button data-preset="reset" title="Origin RSTs the TCP connection. Should be 502 / 1014, not a 524.">/reset</button>
+      <button data-preset="hdrhang" title="200 + headers, then stall. Truncated body, not a 524.">/headers-then-hang</button>
+      <button data-preset="accepthang" title="Accepts TCP then silence. Edge 524, not 1014.">/accept-hang</button>
     </div>
     <div class="row">
       <div><label for="conns" title="Number of independent QUIC connections. Each gets its own UDP socket, so kernel drops can be attributed to one connection.">conns</label><input id="conns" type="number" value="4"></div>
@@ -1116,6 +1118,8 @@ const presets = {
   drip:'https://edge:8443/drip?ms=200&chunks=20',
   echo:'https://edge:8443/echo', headers:'https://edge:8443/headers?n=64&size=128',
   reset:'https://edge:8443/reset',
+  hdrhang:'https://edge:8443/headers-then-hang?ms=30000',
+  accepthang:'https://edge:8443/accept-hang',
 };
 document.querySelectorAll('[data-preset]').forEach(b =>
   b.onclick = () => $('#url').value = presets[b.dataset.preset]);

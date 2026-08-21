@@ -22,6 +22,7 @@ AKS node pool.
    │  tcp/8080   plain HTTP/1.1
    ▼
  origin        ← your app: /fast /slow /hang /drip /bytes /reset /flaky /echo /headers /stall
+                 /headers-then-hang /accept-hang /close-after-headers
 ```
 
 ## Quick start
@@ -462,7 +463,8 @@ v2 are offered and RFC 9221 datagrams are enabled on every hop; PMTUD stays on
 connection migration, retry/key-update tests, ECN marking, or a live qvis panel.
 qlog files plus `tcpdump` remain the escape hatch for frame-level work.
 
-`go test ./internal/integration` runs the stack in-process (fast / 524 / 1014)
-and, when host curl has `--http3-only`, a second-stack GET against the same edge.
+`go test ./internal/integration` runs the stack in-process (fast / 524 / 1014 /
+1033-before-register / HA) plus an interop matrix: quic-go HTTP/3, Go stdlib TLS
+(HTTP/1.1 + Alt-Svc), and curl `--http3-only` when installed.
 
 Build without Docker: `go build ./cmd/quicshot`.

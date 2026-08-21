@@ -70,6 +70,9 @@ func newMux(log *slog.Logger) *http.ServeMux {
 	mux.HandleFunc("/echo", handleEcho)
 	mux.HandleFunc("/headers", handleHeaders)
 	mux.HandleFunc("/stall", handleStall)
+	mux.HandleFunc("/headers-then-hang", handleHeadersThenHang)
+	mux.HandleFunc("/accept-hang", handleAcceptHang)
+	mux.HandleFunc("/close-after-headers", handleCloseAfterHeaders)
 	return mux
 }
 

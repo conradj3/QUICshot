@@ -2,6 +2,7 @@ package origin
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEchoAndHeaders(t *testing.T) {
@@ -27,6 +29,20 @@ func TestEchoAndHeaders(t *testing.T) {
 		}
 		if rr.Header().Get("x-echo-bytes") != "5" {
 			t.Fatalf("x-echo-bytes = %q", rr.Header().Get("x-echo-bytes"))
+		}
+	})
+
+	t.Run("headers-then-hang", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		req := httptest.NewRequest(http.MethodGet, "/headers-then-hang?ms=5000", nil).WithContext(ctx)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != 200 {
+			t.Fatalf("status = %d, want 200 (not a 524)", rr.Code)
+		}
+		if rr.Header().Get("x-origin") != "headers-then-hang" {
+			t.Fatalf("missing headers-then-hang marker")
 		}
 	})
 

@@ -163,6 +163,54 @@ func handleStall(w http.ResponseWriter, r *http.Request) {
 	writeString(w, "stalled\n")
 }
 
+// /headers-then-hang?ms=N writes 200 + headers then stalls. The edge already
+// sent a status line, so this is a truncated body, not a 524.
+func handleHeadersThenHang(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("x-origin", "headers-then-hang")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	d := durationParam(r, "ms", 30*time.Second)
+	select {
+	case <-time.After(d):
+		writeString(w, "late\n")
+	case <-r.Context().Done():
+	}
+}
+
+// /accept-hang hijacks the TCP conn and holds it with no bytes and no RST.
+// The edge origin timeout should fire (524), not 1014.
+func handleAcceptHang(w http.ResponseWriter, r *http.Request) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	conn, _, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	<-r.Context().Done()
+}
+
+// /close-after-headers writes 200 headers then FINs. Distinct from /reset (RST).
+func handleCloseAfterHeaders(w http.ResponseWriter, _ *http.Request) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+	_ = buf.Flush()
+	_ = conn.Close()
+}
+
 func slowReadBody(r *http.Request, gap time.Duration) {
 	buf := make([]byte, 1)
 	for {
