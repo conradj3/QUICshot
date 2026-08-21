@@ -290,6 +290,18 @@
     </div>
     <div class="row">
       <div>
+        <label for="tunnelMaxIdle" title="QUIC max idle timeout on the edge↔connector hop. Independent of the public HTTP/3 hop.">tunnel max idle</label>
+        <input id="tunnelMaxIdle" value="30s">
+      </div>
+      <div>
+        <label for="tunnelKeepAlive" title="QUIC keep-alives on the tunnel hop. cloudflared defaults to keeping this path alive.">tunnel keepalive</label>
+        <input id="tunnelKeepAlive" value="5s">
+      </div>
+    </div>
+    <label for="tunnelLB" title="rr spreads requests. hash pins a path to one connector, which is how you see whether drops follow one replica.">connector pick</label>
+    <select id="tunnelLB"><option value="rr">round-robin</option><option value="hash">hash by path</option></select>
+    <div class="row">
+      <div>
         <label for="connectors" title="How many connector replicas should dial out to the edge. 0 intentionally reproduces the no-connector / 1033 path.">connector replicas</label>
         <input id="connectors" type="number" min="0" max="10" value="1">
       </div>
@@ -355,11 +367,22 @@
       <button data-preset="hang"  title="Origin never responds at all: a 524 from a wedged worker.">/hang</button>
       <button data-preset="bytes" title="1 MB body. Use this to push volume through the tunnel.">/bytes</button>
       <button data-preset="drip"  title="Streams chunks slowly, exercising mid-body disconnects.">/drip</button>
+      <button data-preset="echo"  title="POST echo. Pair with a request body.">/echo</button>
+      <button data-preset="headers" title="Large response headers. QPACK / header-block stress.">/headers</button>
+      <button data-preset="reset" title="Origin RSTs the TCP connection. Should be 502 / 1014, not a 524.">/reset</button>
     </div>
     <div class="row">
       <div><label for="conns" title="Number of independent QUIC connections. Each gets its own UDP socket, so kernel drops can be attributed to one connection.">conns</label><input id="conns" type="number" value="4"></div>
       <div><label for="workers" title="Concurrent requests per connection. These share one QUIC connection, so this is what exposes stream and flow-control effects.">workers</label><input id="workers" type="number" value="8"></div>
-      <div><label for="rps" title="Global request rate cap across ALL workers. 0 means as fast as possible. Always set this against production.">rps</label><input id="rps" type="number" value="0"></div>
+      <div><label for="rps" title="Offered request rate across ALL workers. Required for open-loop. Always set this against production.">rps</label><input id="rps" type="number" value="0"></div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="loadMode" title="closed = each worker waits for a response (RPS collapses when latency rises). open = token bucket starts requests at -rps regardless of in-flight latency.">load mode</label>
+        <select id="loadMode"><option value="closed">closed</option><option value="open">open</option></select>
+      </div>
+      <div><label for="warmup" title="Traffic sent before measurement. Discarded from the summary.">warmup</label><input id="warmup" value="0s"></div>
+      <div><label for="maxInflight" title="Open-loop cap on in-flight requests. 0 = conns × workers × 8.">max inflight</label><input id="maxInflight" type="number" value="0"></div>
     </div>
     <div class="row">
       <div><label for="duration" title="How long the run lasts.">duration</label><input id="duration" value="30s"></div>
@@ -369,6 +392,18 @@
       <div><label for="cKeepAlive" title="Client-side QUIC keep-alive. 0 lets idle connections die; try 1s to prove keep-alives fix it.">client keepalive</label><input id="cKeepAlive" value="0s"></div>
       <div><label for="cMaxIdle" title="Client-side QUIC max idle timeout. Lower it to force idle-timeout disconnects quickly.">client max idle</label><input id="cMaxIdle" value="30s"></div>
     </div>
+    <div class="row">
+      <div>
+        <label for="method" title="HTTP method. POST/PUT need a body.">method</label>
+        <select id="method"><option>GET</option><option>POST</option><option>PUT</option><option>HEAD</option></select>
+      </div>
+      <div>
+        <label for="body" title="Request body sent on every request. Use with POST /echo.">body</label>
+        <input id="body" placeholder="optional">
+      </div>
+    </div>
+    <label for="extraUrls" title="Comma-separated extra URLs mixed round-robin with the target.">extra urls (optional)</label>
+    <input id="extraUrls" placeholder="https://edge:8443/bytes,https://edge:8443/drip">
     <label for="header" title="Sent on every request. Use for authenticated endpoints.">header (optional)</label>
     <input id="header" placeholder="Authorization: Bearer ...">
     <div class="row" style="margin-top:9px">
@@ -385,6 +420,8 @@
     <div class="btns">
       <button class="primary" id="runBlast" title="Start the HTTP/3 load run with the settings above">&#9889; Blast</button>
       <button id="runProbe" title="Safe single-request diagnostic: DNS, TLS, Alt-Svc, HTTP/3, plus a known-good control endpoint">&#9678; Probe</button>
+      <button id="runCurl" title="HTTP/3 GET with curl --http3-only (host curl, or a helper image if the host curl has no HTTP/3)">curl h3</button>
+      <button id="runChrome" title="Headless Chrome forced onto HTTP/3. Skips if Chrome/Chromium is not installed.">Chrome h3</button>
       <button id="readBodyBtn" class="tgl on" title="Drain response bodies. Turn off to abandon them mid-flight and force stream resets.">read body</button>
     </div>
   </div>
@@ -399,6 +436,9 @@
       <button data-scenario="keepalive" title="The same test with keep-alives enabled: zero connection drops.">Keepalive fix</button>
       <button data-scenario="loss"      title="3% packet loss on the edge while pulling 1 MB bodies.">3% loss</button>
       <button data-scenario="1033"      title="Kills the connector, then sends traffic: 502 with error code 1033, not a 524.">No connector</button>
+      <button data-scenario="1014"      title="Origin RSTs the TCP socket: 502 with error code 1014, not a 524.">Origin RST</button>
+      <button data-scenario="open"      title="Open-loop 50 rps against /fast. Offered load stays put when latency rises.">Open-loop</button>
+      <button data-scenario="0rtt"      title="Dial twice and record whether the second handshake used 0-RTT.">0-RTT probe</button>
     </div>
     <div class="hint">Each preset fills the form and starts the run. Hover a button to see what it proves.</div>
   </div>
@@ -488,8 +528,13 @@
         <code>packets_lost=0</code> in the detail: that is the proof.</td></tr>
       <tr><td>sndbuf_err / rcvbuf_err</td><td>Kernel UDP counters in the header. Non-zero means datagrams
         were dropped locally. This is the number to pull off an AKS node.</td></tr>
-      <tr><td>negotiated protocol</td><td>In the blast summary. Any <code>HTTP/2.0</code> line means the
-        server fell back and you are not testing HTTP/3 at all.</td></tr>
+      <tr><td>negotiated protocol</td><td>In the blast summary. Blast itself is HTTP/3-only (ALPN
+        <code>h3</code>), so HTTP/2 here means you pointed at the wrong client, not a silent fallback.
+        Use <b>curl h3</b> / <b>Chrome h3</b> for a second stack.</td></tr>
+      <tr><td>omitted</td><td>Open-loop ticks dropped because max-inflight was full. That is coordinated
+        omission: the generator could not start the request on time.</td></tr>
+      <tr><td>used_0rtt</td><td>Second dial of the 0-RTT probe reused a session ticket. First dials are
+        always 1-RTT.</td></tr>
     </table>
 
     <h3>The three timeouts interact</h3>
@@ -509,10 +554,20 @@
       a blast result would be meaningless. Get authorisation before pointing sustained load at
       someone else's production.</p>
 
+    <h3>Closed-loop vs open-loop</h3>
+    <p><b>Closed-loop</b> (default) has N×M workers that wait for each response. When the origin
+      slows down, completed RPS collapses. <b>Open-loop</b> starts requests from a token bucket at
+      the configured rps regardless of in-flight latency, and counts <code>omitted</code> when
+      max-inflight is saturated. Use open-loop when you want to hold offered load through a 524 window.</p>
+
     <h3>Impairment caveat</h3>
     <p><code>tc netem</code> attached to <code>root</code> on a container veth is not applied evenly
       across TX queues, so request counts and medians vary a lot between runs. Trust the kernel
       counters and the latency tail.</p>
+    <p><code>SndbufErrors</code> moves reliably with a rate cap. <code>RcvbufErrors</code> needs the
+      receiving process to stall, which this lab has not reproduced on Docker Desktop. Use
+      <code>scripts/rcvbuf-pressure.sh</code> on native Linux, or treat a zero rcvbuf counter as
+      inconclusive rather than a pass.</p>
 
     <h3>Safety</h3>
     <p>This panel shell-executes docker and tc on your machine. It binds to <code>127.0.0.1</code>
@@ -1010,6 +1065,8 @@ document.querySelectorAll('[data-stack]').forEach(b => b.onclick = () => {
   post('/api/stack', {
     action: b.dataset.stack, originTimeout: $('#originTimeout').value,
     maxIdle: $('#maxIdle').value, keepAlive: $('#keepAlive').value,
+    tunnelMaxIdle: $('#tunnelMaxIdle').value, tunnelKeepAlive: $('#tunnelKeepAlive').value,
+    tunnelLB: $('#tunnelLB').value,
     connectors: +$('#connectors').value,
   });
 });
@@ -1057,6 +1114,8 @@ const presets = {
   fast:'https://edge:8443/fast', slow:'https://edge:8443/slow?ms=20000',
   hang:'https://edge:8443/hang', bytes:'https://edge:8443/bytes?n=1048576',
   drip:'https://edge:8443/drip?ms=200&chunks=20',
+  echo:'https://edge:8443/echo', headers:'https://edge:8443/headers?n=64&size=128',
+  reset:'https://edge:8443/reset',
 };
 document.querySelectorAll('[data-preset]').forEach(b =>
   b.onclick = () => $('#url').value = presets[b.dataset.preset]);
@@ -1068,6 +1127,9 @@ const runBody = tool => ({
   keepAlive:$('#cKeepAlive').value, maxIdle:$('#cMaxIdle').value,
   rps:+$('#rps').value, readBody, localCerts:$('#localCerts').value === 'true',
   headers: $('#header').value ? [$('#header').value] : [],
+  mode: $('#loadMode').value, warmup: $('#warmup').value,
+  maxInflight: +$('#maxInflight').value, method: $('#method').value,
+  body: $('#body').value, urls: $('#extraUrls').value,
 });
 $('#runBlast').onclick = async () => {
   if (!ensureIdle('blast')) return;
@@ -1079,6 +1141,13 @@ $('#runProbe').onclick = async () => {
   if (!await beginNewTest('Start a new probe test and reset counters?')) return;
   post('/api/run', runBody('probe'));
 };
+const runClient = async tool => {
+  if (!ensureIdle(tool)) return;
+  if (!await beginNewTest('Start a new ' + tool + ' check and reset counters?')) return;
+  post('/api/run', runBody(tool));
+};
+$('#runCurl').onclick = () => runClient('curl');
+$('#runChrome').onclick = () => runClient('chrome');
 
 const scenarios = {
   baseline:  {url:presets.fast,  conns:4, workers:16, duration:'30s', timeout:'30s'},
@@ -1092,12 +1161,20 @@ const scenarios = {
               impair:{mode:'loss', a:'3%'}},
   '1033':    {url:presets.fast,  conns:1, workers:1,  duration:'10s', timeout:'10s',
               killConnector:true},
+  '1014':    {url:presets.reset, conns:1, workers:1,  duration:'10s', timeout:'10s'},
+  open:      {url:presets.fast,  conns:2, workers:4,  duration:'20s', timeout:'10s',
+              rps:50, loadMode:'open', maxInflight:64},
+  '0rtt':    {url:presets.fast,  conns:1, workers:1,  duration:'5s', timeout:'10s',
+              probe0rtt:true},
 };
 document.querySelectorAll('[data-scenario]').forEach(b => b.onclick = async () => {
   if (!ensureIdle('scenario')) return;
   if (!await beginNewTest('Start a new scenario and reset counters/flow tracking?')) return;
   const s = scenarios[b.dataset.scenario];
   for (const k in s) { const el = $('#' + k); if (el) el.value = s[k]; }
+  if (s.rps !== undefined) $('#rps').value = s.rps;
+  if (s.loadMode) $('#loadMode').value = s.loadMode;
+  if (s.maxInflight !== undefined) $('#maxInflight').value = s.maxInflight;
   if (s.impair) {
     $('#impMode').value = s.impair.mode; $('#impA').value = s.impair.a;
     if (await post('/api/impair', {service:'edge', mode:s.impair.mode, a:s.impair.a, b:''})) await waitForIdle();
@@ -1106,7 +1183,9 @@ document.querySelectorAll('[data-scenario]').forEach(b => b.onclick = async () =
     if (await post('/api/stack', {action:'stop-connector'})) await waitForIdle();
     push({src:'ui', ts:new Date().toTimeString().slice(0,8), line:'No connector scenario leaves the connector stopped. Use Restore 1 or Scale to bring it back.'});
   }
-  post('/api/run', runBody('blast'));
+  const body = runBody('blast');
+  if (s.probe0rtt) body.probe0rtt = true;
+  post('/api/run', body);
 });
 </script>
 </body>
