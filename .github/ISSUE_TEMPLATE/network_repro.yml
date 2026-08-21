@@ -1,0 +1,44 @@
+name: Network reproduction report
+description: Share evidence from an HTTP/3, QUIC, tunnel, or UDP-buffer scenario
+title: "network: "
+labels: [networking]
+body:
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - macOS Docker Desktop
+        - Native Linux Docker
+        - CI runner
+        - Kubernetes / AKS
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario
+      description: Which path are you exercising: 524, connector loss, idle timeout, UDP buffer pressure, probe failure, or another case?
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Include redacted blast JSONL, edge/connector logs, UDP counters, qlog notes, or pcap observations.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: interpretation
+    attributes:
+      label: Current interpretation
+      description: What do you think the evidence shows?
