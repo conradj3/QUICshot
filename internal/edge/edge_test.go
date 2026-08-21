@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -57,5 +58,25 @@ func TestWriteCFError(t *testing.T) {
 	}
 	if got := rr.Body.String(); got != "error code: 524\norigin did not respond in time\n" {
 		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestPickConnectorIndex(t *testing.T) {
+	var rr atomic.Uint64
+	if got := pickConnectorIndex(3, "/fast", "rr", &rr); got != 0 {
+		t.Fatalf("first rr pick = %d, want 0", got)
+	}
+	if got := pickConnectorIndex(3, "/fast", "rr", &rr); got != 1 {
+		t.Fatalf("second rr pick = %d, want 1", got)
+	}
+
+	a := pickConnectorIndex(4, "/fast", "hash", &rr)
+	b := pickConnectorIndex(4, "/fast", "hash", &rr)
+	if a != b {
+		t.Fatalf("hash(/fast) was not sticky: %d vs %d", a, b)
+	}
+	c := pickConnectorIndex(4, "/bytes", "hash", &rr)
+	if a == c {
+		t.Logf("hash(/fast)=%d hash(/bytes)=%d (collision is allowed)", a, c)
 	}
 }
