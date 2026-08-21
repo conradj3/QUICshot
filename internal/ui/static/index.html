@@ -46,10 +46,30 @@
   .stat.bad b { color:var(--err); }
   .spacer { margin-left:auto; }
 
-  .layout { flex:1; min-height:0; display:grid; grid-template-columns:352px 1fr; }
+  .layout { flex:1; min-height:0; display:grid;
+    grid-template-columns:minmax(280px, 352px) minmax(0, 1fr) minmax(260px, 340px); }
   aside.side { min-height:0; overflow-y:auto; overflow-x:hidden; padding:13px;
           background:var(--panel); border-right:1px solid var(--line); }
+  aside.side.metrics { border-right:0; border-left:1px solid var(--line); }
+  aside.side.metrics .card:last-child { margin-bottom:0; }
   main { min-height:0; min-width:0; display:flex; flex-direction:column; }
+
+  @media (max-width: 1400px) {
+    .layout { grid-template-columns:minmax(260px, 320px) minmax(0, 1fr) minmax(240px, 310px); }
+  }
+
+  @media (max-width: 980px) {
+    .layout { grid-template-columns:minmax(260px, 320px) minmax(0, 1fr); }
+    aside.side.metrics { grid-column:1 / span 2; border-left:0; border-top:1px solid var(--line); }
+  }
+
+  @media (max-width: 860px) {
+    body { overflow:auto; }
+    .layout { display:block; }
+    aside.side { border-right:0; border-top:1px solid var(--line); }
+    aside.side.metrics { border-top:1px solid var(--line); grid-column:auto; }
+    main { min-height:55vh; }
+  }
 
   .card { border:1px solid var(--line); border-radius:var(--r); background:var(--panel2);
           padding:12px; margin-bottom:12px; }
@@ -84,14 +104,14 @@
   .hint { font-size:10.5px; color:var(--faint); margin-top:9px; line-height:1.5; }
   .srOnly { position:absolute !important; width:1px; height:1px; padding:0; margin:-1px;
     overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
-  .miniTable { display:grid; grid-template-columns:1fr auto; gap:4px 8px; font:11px ui-monospace,monospace; color:var(--dim); }
+  .miniTable { font:11px ui-monospace,monospace; color:var(--dim); }
   .miniTable b { color:var(--fg); font-weight:600; }
   .healthRow { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
   .healthPill { font:10.5px ui-monospace,monospace; padding:3px 8px; border-radius:99px; border:1px solid var(--line); color:var(--dim); }
   .healthPill.warn { border-color:#6b4a1f; color:var(--warn); background:#241a0d; }
   .healthPill.bad { border-color:#7a2b2b; color:var(--err); background:#1d1214; }
 
-  .toolbar { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 12px;
+  .toolbar { flex:0 0 auto; display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding:8px 12px;
     background:var(--panel); border-bottom:1px solid var(--line); }
   .chip { font:11px ui-monospace,monospace; padding:3px 10px; border-radius:99px; user-select:none;
     border:1px solid var(--line); color:var(--faint); cursor:pointer; transition:.14s; }
@@ -131,7 +151,8 @@
   .empty { color:var(--faint); padding:26px 16px; font-family:ui-sans-serif,sans-serif; }
 
   #flow { flex:0 0 auto; display:flex; align-items:stretch; padding:13px 16px 11px;
-    background:linear-gradient(180deg,#101722,#0d131c); border-bottom:1px solid var(--line); }
+    background:linear-gradient(180deg,#101722,#0d131c); border-bottom:1px solid var(--line);
+    overflow-x:auto; }
   .fnode { flex:0 0 auto; min-width:134px; border:1px solid var(--line); border-radius:9px;
     background:#141c28; padding:8px 11px; transition:border-color .25s, box-shadow .25s, opacity .25s; cursor:pointer; }
   .fnode.sel { border-color:var(--accent); box-shadow:0 0 0 2px #5eb3ff22, 0 0 18px #5eb3ff22; }
@@ -166,7 +187,7 @@
   #componentMetrics { font:11.5px ui-monospace,monospace; color:var(--dim); }
   .metricLine { display:flex; justify-content:space-between; gap:10px; padding:3px 0; border-top:1px solid #24304380; }
   .metricLine:first-child { border-top:0; }
-  .metricLine b { color:var(--fg); font-weight:600; text-align:right; }
+  .metricLine b { color:var(--fg); font-weight:600; text-align:right; overflow-wrap:anywhere; }
 
   .chip.on#prettyChip { background:var(--accent); border-color:var(--accent); }
   .kv { display:inline-flex; gap:3px; margin-right:9px; white-space:nowrap; }
@@ -215,6 +236,34 @@
   <button class="danger" id="stop" disabled title="Cancel the run in progress">&#9632; Stop</button>
 </header>
 
+<div id="flow" title="Live view of the request path. Links animate while traffic flows and turn red on failures.">
+  <button type="button" class="fnode" id="fClient" data-component="client" aria-label="Show client metrics" title="Click for client metrics">
+    <div class="fname">client</div><div class="fsub">blast / browser</div>
+    <div class="fmetric"><span class="m">req <b id="cReq">0</b></span><span class="m err">fail <b id="cFail">0</b></span></div>
+  </button>
+  <div class="flink" id="lk1"><div class="flabel">HTTP/3 &middot; UDP 8443</div><div class="bar"></div><div class="fbadge" id="bd1"></div></div>
+  <button type="button" class="fnode" id="fEdge" data-component="edge" aria-label="Show edge metrics" title="Click for edge metrics">
+    <div class="fname">edge</div><div class="fsub">cloudflare stand-in</div>
+    <div class="fmetric">
+      <span class="m">rps <b id="eRps">0</b></span>
+      <span class="m">p95 <b id="eP95">0</b>ms</span>
+      <span class="m">p99 <b id="eP99">0</b>ms</span>
+      <span class="m err">524 <b id="e524">0</b></span>
+      <span class="m err">5xx <b id="e502">0</b></span>
+    </div>
+  </button>
+  <div class="flink" id="lk2"><div class="flabel">QUIC tunnel &middot; 7844</div><div class="bar"></div><div class="fbadge" id="bd2"></div></div>
+  <button type="button" class="fnode" id="fConn" data-component="connector" aria-label="Show connector metrics" title="Click for connector metrics">
+    <div class="fname">connector</div><div class="fsub">cloudflared stand-in</div>
+    <div class="fmetric"><span class="m" id="tunState">tunnel <b>&mdash;</b></span></div>
+  </button>
+  <div class="flink" id="lk3"><div class="flabel">HTTP/1.1 &middot; 8080</div><div class="bar"></div><div class="fbadge" id="bd3"></div></div>
+  <button type="button" class="fnode" id="fOrigin" data-component="origin" aria-label="Show origin metrics" title="Click for origin metrics">
+    <div class="fname">origin</div><div class="fsub">your app</div>
+    <div class="fmetric"><span class="m">reached <b id="oRps">0</b>/s</span></div>
+  </button>
+</div>
+
 <div class="layout">
 <aside class="side" aria-label="Controls">
 
@@ -256,12 +305,6 @@
   </div>
 
   <div class="card">
-    <h2>&#9638; Component metrics</h2>
-    <div id="componentMetrics">Click client, edge, connector, or origin in the flow view.</div>
-    <div class="hint">Scenarios and manual blast/probe runs can start a new test and reset these counters.</div>
-  </div>
-
-  <div class="card">
     <h2>&#9672; Impairment</h2>
     <div class="row">
       <div>
@@ -300,25 +343,6 @@
     </div>
     <div class="hint">netem on a multi-queue veth is applied unevenly &mdash; read the kernel counters and the
       latency <em>tail</em>, not the median.</div>
-  </div>
-
-  <div class="card">
-    <h2>&#9711; Connection lifecycle</h2>
-    <div id="lifecycleMetrics" class="miniTable">Waiting for flow data.</div>
-    <div class="hint">Tracks active QUIC sessions, opens/closes per second, and cumulative drops.</div>
-  </div>
-
-  <div class="card">
-    <h2>&#9881; Protocol visibility</h2>
-    <div id="protocolMetrics" class="miniTable">Waiting for flow data.</div>
-    <div class="hint">Shows negotiated protocol counts, QUIC versions, and 0-RTT acceptance ratio.</div>
-  </div>
-
-  <div class="card">
-    <h2>&#128295; Service health</h2>
-    <div id="serviceHealth" class="miniTable">Waiting for health samples.</div>
-    <div id="serviceHealthBadges" class="healthRow"></div>
-    <div class="hint">CPU/memory are max values across service replicas; buffer errors indicate socket pressure.</div>
   </div>
 
   <div class="card">
@@ -382,33 +406,6 @@
 </aside>
 
 <main>
-  <div id="flow" title="Live view of the request path. Links animate while traffic flows and turn red on failures.">
-    <button type="button" class="fnode" id="fClient" data-component="client" aria-label="Show client metrics" title="Click for client metrics">
-      <div class="fname">client</div><div class="fsub">blast / browser</div>
-      <div class="fmetric"><span class="m">req <b id="cReq">0</b></span><span class="m err">fail <b id="cFail">0</b></span></div>
-    </button>
-    <div class="flink" id="lk1"><div class="flabel">HTTP/3 &middot; UDP 8443</div><div class="bar"></div><div class="fbadge" id="bd1"></div></div>
-    <button type="button" class="fnode" id="fEdge" data-component="edge" aria-label="Show edge metrics" title="Click for edge metrics">
-      <div class="fname">edge</div><div class="fsub">cloudflare stand-in</div>
-      <div class="fmetric">
-        <span class="m">rps <b id="eRps">0</b></span>
-        <span class="m">p95 <b id="eP95">0</b>ms</span>
-        <span class="m">p99 <b id="eP99">0</b>ms</span>
-        <span class="m err">524 <b id="e524">0</b></span>
-        <span class="m err">5xx <b id="e502">0</b></span>
-      </div>
-    </button>
-    <div class="flink" id="lk2"><div class="flabel">QUIC tunnel &middot; 7844</div><div class="bar"></div><div class="fbadge" id="bd2"></div></div>
-    <button type="button" class="fnode" id="fConn" data-component="connector" aria-label="Show connector metrics" title="Click for connector metrics">
-      <div class="fname">connector</div><div class="fsub">cloudflared stand-in</div>
-      <div class="fmetric"><span class="m" id="tunState">tunnel <b>&mdash;</b></span></div>
-    </button>
-    <div class="flink" id="lk3"><div class="flabel">HTTP/1.1 &middot; 8080</div><div class="bar"></div><div class="fbadge" id="bd3"></div></div>
-    <button type="button" class="fnode" id="fOrigin" data-component="origin" aria-label="Show origin metrics" title="Click for origin metrics">
-      <div class="fname">origin</div><div class="fsub">your app</div>
-      <div class="fmetric"><span class="m">reached <b id="oRps">0</b>/s</span></div>
-    </button>
-  </div>
   <div class="toolbar">
     <span class="chip on" data-f="edge" title="Show or hide edge container logs">edge</span>
     <span class="chip on" data-f="connector" title="Show or hide connector container logs">connector</span>
@@ -427,6 +424,33 @@
     <button id="newBadge">&#8595; new output</button>
   </div>
 </main>
+
+<aside class="side metrics" aria-label="Diagnostics">
+  <div class="card">
+    <h2>&#9638; Component metrics</h2>
+    <div id="componentMetrics">Click client, edge, connector, or origin in the flow view.</div>
+    <div class="hint">Scenarios and manual blast/probe runs can start a new test and reset these counters.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#9711; Connection lifecycle</h2>
+    <div id="lifecycleMetrics" class="miniTable">Waiting for flow data.</div>
+    <div class="hint">Tracks active QUIC sessions, opens/closes per second, and cumulative drops.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#9881; Protocol visibility</h2>
+    <div id="protocolMetrics" class="miniTable">Waiting for flow data.</div>
+    <div class="hint">Shows negotiated protocol counts, QUIC versions, and 0-RTT acceptance ratio.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#128295; Service health</h2>
+    <div id="serviceHealth" class="miniTable">Waiting for health samples.</div>
+    <div id="serviceHealthBadges" class="healthRow"></div>
+    <div class="hint">CPU/memory are max values across service replicas; buffer errors indicate socket pressure.</div>
+  </div>
+</aside>
 </div>
 
 <div id="scrim"></div>
