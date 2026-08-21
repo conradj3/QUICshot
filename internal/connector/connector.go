@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/conrad/quicshot/internal/qlogtrace"
 	"github.com/conrad/quicshot/internal/quiccfg"
 	"github.com/conrad/quicshot/internal/quicerr"
+	"github.com/conrad/quicshot/internal/tunnelproto"
 )
 
 func Main(args []string) error {
@@ -36,6 +38,9 @@ func Main(args []string) error {
 	keepAlive := fs.Duration("keepalive", 5*time.Second, "QUIC keep-alive period on the tunnel hop")
 	originTimeout := fs.Duration("origin-timeout", 100*time.Second, "connector-side timeout when talking to the origin")
 	qlogDir := fs.String("qlog-dir", "", "write QUIC qlog traces to this directory (empty disables)")
+	ha := fs.Int("ha-connections", 1, "QUIC connections this process opens to the edge (cloudflared default is 4)")
+	originReuse := fs.Bool("origin-reuse", true, "pool idle TCP connections to the origin")
+	originHTTP2 := fs.Bool("origin-http2", false, "allow HTTP/2 to the origin")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -54,76 +59,115 @@ func Main(args []string) error {
 		tlsConf.RootCAs = pool
 	}
 
-	origin := &http.Client{
-		Timeout: *originTimeout,
-		Transport: &http.Transport{
-			MaxIdleConnsPerHost: 256,
-			DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-		},
-	}
+	origin := optsOriginClient(*originTimeout, *originReuse, *originHTTP2)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return Start(ctx, StartOpts{
 		EdgeAddr: *edgeAddr, OriginURL: *originURL, TLS: tlsConf,
 		Idle: *maxIdle, KeepAlive: *keepAlive, QlogDir: *qlogDir, Origin: origin,
+		HA: *ha, Hostname: *serverName,
 	})
+}
+
+func optsOriginClient(timeout time.Duration, reuse, http2 bool) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 256,
+			IdleConnTimeout:     90 * time.Second,
+			DisableKeepAlives:   !reuse,
+			ForceAttemptHTTP2:   http2,
+			DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		},
+	}
 }
 
 // StartOpts is the in-process connector configuration used by tests.
 type StartOpts struct {
-	EdgeAddr, OriginURL, QlogDir string
-	TLS                          *tls.Config
-	Idle, KeepAlive              time.Duration
-	Origin                       *http.Client
-	Log                          *slog.Logger
+	EdgeAddr, OriginURL, QlogDir, Hostname string
+	TLS                                    *tls.Config
+	Idle, KeepAlive                        time.Duration
+	Origin                                 *http.Client
+	Log                                    *slog.Logger
+	HA                                     int
+	SkipRegister                           bool
+	RegisterDelay                          time.Duration
 }
 
-// Start dials the edge and serves origin proxy streams until ctx is cancelled.
+// Start dials the edge (HA times) and serves origin proxy streams until ctx is cancelled.
 func Start(ctx context.Context, opts StartOpts) error {
 	log := opts.Log
 	if log == nil {
 		log = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("role", "connector")
 	}
+	if opts.Origin == nil {
+		opts.Origin = optsOriginClient(100*time.Second, true, false)
+	}
+	n := opts.HA
+	if n < 1 {
+		n = 1
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(haID int) {
+			defer wg.Done()
+			reconnectLoop(ctx, log.With("ha_id", haID), opts, haID)
+		}(i)
+	}
+	wg.Wait()
+	return nil
+}
+
+func reconnectLoop(ctx context.Context, log *slog.Logger, opts StartOpts, haID int) {
 	backoff := 500 * time.Millisecond
 	for ctx.Err() == nil {
 		err := runOnce(ctx, log, runConfig{
-			edgeAddr:  opts.EdgeAddr,
-			originURL: opts.OriginURL,
-			tlsConf:   opts.TLS,
-			quicConf:  quiccfg.Client(opts.Idle, opts.KeepAlive),
-			qlogDir:   opts.QlogDir,
-			origin:    opts.Origin,
+			edgeAddr:      opts.EdgeAddr,
+			originURL:     opts.OriginURL,
+			tlsConf:       opts.TLS,
+			quicConf:      quiccfg.Client(opts.Idle, opts.KeepAlive),
+			qlogDir:       opts.QlogDir,
+			origin:        opts.Origin,
+			haID:          haID,
+			hostname:      opts.Hostname,
+			keepAlive:     opts.KeepAlive,
+			skipRegister:  opts.SkipRegister,
+			registerDelay: opts.RegisterDelay,
 		})
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
 		kind, detail := quicerr.Classify(err)
 		log.Warn("tunnel down, reconnecting", "backoff", backoff.String(),
 			"close_kind", string(kind), "close_detail", detail)
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-time.After(backoff):
 		}
 		if backoff < 10*time.Second {
 			backoff *= 2
 		}
 	}
-	return nil
 }
 
 type runConfig struct {
-	edgeAddr  string
-	originURL string
-	tlsConf   *tls.Config
-	quicConf  *quic.Config
-	qlogDir   string
-	origin    *http.Client
+	edgeAddr      string
+	originURL     string
+	tlsConf       *tls.Config
+	quicConf      *quic.Config
+	qlogDir       string
+	origin        *http.Client
+	haID          int
+	hostname      string
+	keepAlive     time.Duration
+	skipRegister  bool
+	registerDelay time.Duration
 }
 
 func runOnce(ctx context.Context, log *slog.Logger, cfg runConfig) error {
-
 	if err := qlogtrace.Configure(cfg.quicConf, cfg.qlogDir); err != nil {
 		return err
 	}
@@ -138,12 +182,70 @@ func runOnce(ctx context.Context, log *slog.Logger, cfg runConfig) error {
 	log.Info("tunnel established", "edge", cfg.edgeAddr, "local", conn.LocalAddr().String())
 	defer conn.CloseWithError(0, "connector shutting down")
 
+	if !cfg.skipRegister {
+		if cfg.registerDelay > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(cfg.registerDelay):
+			}
+		}
+		ctrl, err := conn.OpenStreamSync(ctx)
+		if err != nil {
+			return fmt.Errorf("open control stream: %w", err)
+		}
+		host := cfg.hostname
+		if host == "" {
+			host = "local"
+		}
+		if err := tunnelproto.Write(ctrl, tunnelproto.Msg{T: tunnelproto.TypeRegister, Hostname: host, HAID: cfg.haID}); err != nil {
+			return fmt.Errorf("register: %w", err)
+		}
+		go pingLoop(ctx, ctrl, cfg.keepAlive)
+		go func() {
+			<-ctx.Done()
+			_ = tunnelproto.Write(ctrl, tunnelproto.Msg{T: tunnelproto.TypeUnregister, Reason: "shutdown"})
+		}()
+	}
+
+	var inflight sync.WaitGroup
+	defer func() {
+		done := make(chan struct{})
+		go func() { inflight.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}()
+
 	for {
 		str, err := conn.AcceptStream(ctx)
 		if err != nil {
 			return err
 		}
-		go serveStream(log, str, cfg.originURL, cfg.origin)
+		inflight.Add(1)
+		go func() {
+			defer inflight.Done()
+			serveStream(log, str, cfg.originURL, cfg.origin)
+		}()
+	}
+}
+
+func pingLoop(ctx context.Context, w io.Writer, every time.Duration) {
+	if every <= 0 {
+		every = 5 * time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := tunnelproto.Write(w, tunnelproto.Msg{T: tunnelproto.TypePing}); err != nil {
+				return
+			}
+		}
 	}
 }
 

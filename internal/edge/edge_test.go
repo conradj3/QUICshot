@@ -61,6 +61,26 @@ func TestWriteCFError(t *testing.T) {
 	}
 }
 
+func TestConnectorRefLiveRequiresRegister(t *testing.T) {
+	now := time.Now()
+	c := connectorRef{}
+	if c.live(now, time.Second) {
+		t.Fatal("unregistered connector must not be live")
+	}
+	c.registered = true
+	c.lastPing = now
+	if !c.live(now, 3*time.Second) {
+		t.Fatal("fresh register should be live")
+	}
+	c.lastPing = now.Add(-10 * time.Second)
+	if c.live(now, 3*time.Second) {
+		t.Fatal("stale ping should not be live")
+	}
+	if !c.live(now, 0) {
+		t.Fatal("staleAfter=0 disables expiry")
+	}
+}
+
 func TestPickConnectorIndex(t *testing.T) {
 	var rr atomic.Uint64
 	if got := pickConnectorIndex(3, "/fast", "rr", &rr); got != 0 {

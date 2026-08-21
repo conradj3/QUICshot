@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestResetTunnelOnOriginError(t *testing.T) {
@@ -18,6 +19,19 @@ func TestResetTunnelOnOriginError(t *testing.T) {
 	}
 	if resetTunnelOnOriginError(nil, nil) {
 		t.Fatal("nil origin error should not reset")
+	}
+}
+
+func TestOriginClientReuseFlag(t *testing.T) {
+	pooled := optsOriginClient(time.Second, true, false)
+	tr, ok := pooled.Transport.(*http.Transport)
+	if !ok || tr.DisableKeepAlives {
+		t.Fatal("reuse=true should keep origin connections pooled")
+	}
+	fresh := optsOriginClient(time.Second, false, true)
+	tr, ok = fresh.Transport.(*http.Transport)
+	if !ok || !tr.DisableKeepAlives || !tr.ForceAttemptHTTP2 {
+		t.Fatal("reuse=false http2=true should disable keep-alives and allow h2")
 	}
 }
 

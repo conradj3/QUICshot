@@ -32,6 +32,7 @@ import (
 	"github.com/conrad/quicshot/internal/qlogtrace"
 	"github.com/conrad/quicshot/internal/quiccfg"
 	"github.com/conrad/quicshot/internal/quicerr"
+	"github.com/conrad/quicshot/internal/tunnelproto"
 	"github.com/conrad/quicshot/internal/udpsock"
 )
 
@@ -65,8 +66,12 @@ type Edge struct {
 }
 
 type connectorRef struct {
-	id   uint64
-	conn *quic.Conn
+	id         uint64
+	conn       *quic.Conn
+	registered bool
+	lastPing   time.Time
+	hostname   string
+	haID       int
 }
 
 func Main(args []string) error {
@@ -216,34 +221,140 @@ func (e *Edge) addConnector(conn *quic.Conn) {
 	e.connectors = append(e.connectors, connectorRef{id: id, conn: conn})
 	n := len(e.connectors)
 	e.mu.Unlock()
-	e.log.Info("connector registered", "connector_id", id, "remote", conn.RemoteAddr().String(), "connectors", n)
+	e.log.Info("connector connected", "connector_id", id, "remote", conn.RemoteAddr().String(),
+		"connectors", n, "registered", 0)
 
-	go func() {
-		<-conn.Context().Done()
-		kind, detail := quicerr.CloseReason(conn.Context())
-		e.mu.Lock()
-		for i, c := range e.connectors {
-			if c.conn == conn {
-				e.connectors = append(e.connectors[:i], e.connectors[i+1:]...)
-				break
-			}
+	go e.serveControl(conn, id)
+	go e.watchLost(conn, id)
+}
+
+func (e *Edge) watchLost(conn *quic.Conn, id uint64) {
+	<-conn.Context().Done()
+	kind, detail := quicerr.CloseReason(conn.Context())
+	e.mu.Lock()
+	for i, c := range e.connectors {
+		if c.conn == conn {
+			e.connectors = append(e.connectors[:i], e.connectors[i+1:]...)
+			break
 		}
-		n := len(e.connectors)
-		e.mu.Unlock()
-		e.log.Warn("connector lost", "connector_id", id, "remote", conn.RemoteAddr().String(), "connectors", n,
-			"close_kind", string(kind), "close_detail", detail)
-	}()
+	}
+	n, live := len(e.connectors), e.registeredLocked()
+	e.mu.Unlock()
+	e.log.Warn("connector lost", "connector_id", id, "remote", conn.RemoteAddr().String(),
+		"connectors", n, "registered", live, "close_kind", string(kind), "close_detail", detail)
+}
+
+func (e *Edge) serveControl(conn *quic.Conn, id uint64) {
+	str, err := conn.AcceptStream(conn.Context())
+	if err != nil {
+		return
+	}
+	br := bufio.NewReader(str)
+	for {
+		msg, err := tunnelproto.Read(br)
+		if err != nil {
+			e.updateConnector(id, func(c *connectorRef) { c.registered = false })
+			return
+		}
+		switch msg.T {
+		case tunnelproto.TypeRegister:
+			e.updateConnector(id, func(c *connectorRef) {
+				c.registered = true
+				c.lastPing = time.Now()
+				c.hostname = msg.Hostname
+				c.haID = msg.HAID
+			})
+			e.log.Info("connector registered", "connector_id", id, "ha_id", msg.HAID,
+				"hostname", msg.Hostname, "registered", e.Registered())
+		case tunnelproto.TypePing:
+			e.updateConnector(id, func(c *connectorRef) { c.lastPing = time.Now() })
+		case tunnelproto.TypeUnregister:
+			e.updateConnector(id, func(c *connectorRef) { c.registered = false })
+			e.log.Info("connector unregistered", "connector_id", id, "reason", msg.Reason,
+				"registered", e.Registered())
+		}
+	}
+}
+
+func (e *Edge) updateConnector(id uint64, fn func(*connectorRef)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range e.connectors {
+		if e.connectors[i].id == id {
+			fn(&e.connectors[i])
+			return
+		}
+	}
+}
+
+// Registered is the count of connectors that have sent register and not unregistered.
+func (e *Edge) Registered() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.registeredLocked()
+}
+
+func (e *Edge) registeredLocked() int {
+	n := 0
+	now := time.Now()
+	stale := e.staleAfter()
+	for _, c := range e.connectors {
+		if c.live(now, stale) {
+			n++
+		}
+	}
+	return n
+}
+
+func (e *Edge) staleAfter() time.Duration {
+	if e.cfg.tunnelKeepAlive <= 0 {
+		return 0
+	}
+	return 3 * e.cfg.tunnelKeepAlive
+}
+
+func (c connectorRef) live(now time.Time, stale time.Duration) bool {
+	if !c.registered {
+		return false
+	}
+	if stale <= 0 || c.lastPing.IsZero() {
+		return true
+	}
+	return now.Sub(c.lastPing) < stale
 }
 
 func (e *Edge) pickConnector(key string) (connectorRef, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	n := len(e.connectors)
-	if n == 0 {
+	now := time.Now()
+	stale := e.staleAfter()
+	live := make([]connectorRef, 0, len(e.connectors))
+	for _, c := range e.connectors {
+		if c.live(now, stale) {
+			live = append(live, c)
+		}
+	}
+	if len(live) == 0 {
 		return connectorRef{}, false
 	}
-	i := pickConnectorIndex(n, key, e.cfg.tunnelLB, &e.rr)
-	return e.connectors[i], true
+	i := pickConnectorIndex(len(live), key, e.cfg.tunnelLB, &e.rr)
+	return live[i], true
+}
+
+// WaitRegistered blocks until n connectors have registered or ctx is done.
+func (e *Edge) WaitRegistered(ctx context.Context, n int) error {
+	deadline := time.NewTicker(20 * time.Millisecond)
+	defer deadline.Stop()
+	for {
+		if e.Registered() >= n {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for %d registered connectors: %w", n, ctx.Err())
+		case <-deadline.C:
+		}
+	}
 }
 
 func pickConnectorIndex(n int, key, mode string, rr *atomic.Uint64) int {

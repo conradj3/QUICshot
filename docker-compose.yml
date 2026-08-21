@@ -64,6 +64,8 @@ services:
       - -max-idle-timeout=${CONNECTOR_MAX_IDLE:-30s}
       - -keepalive=${CONNECTOR_KEEPALIVE:-5s}
       - -origin-timeout=${CONNECTOR_ORIGIN_TIMEOUT:-100s}
+      - -ha-connections=${CONNECTOR_HA:-1}
+      - -origin-reuse=${CONNECTOR_ORIGIN_REUSE:-true}
       - -qlog-dir=${CONNECTOR_QLOG_DIR:-}
     depends_on:
       certs:
