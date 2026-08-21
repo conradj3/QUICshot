@@ -2,6 +2,7 @@ package ui
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -127,5 +128,38 @@ func TestParsePercent(t *testing.T) {
 	}
 	if got := parsePercent("bad"); got != 0 {
 		t.Fatalf("parsePercent() = %v, want 0", got)
+	}
+}
+
+func TestStackCommandTunnelLB(t *testing.T) {
+	if _, _, err := stackCommand(stackReq{Action: "up", TunnelLB: "wrr"}); err == nil {
+		t.Fatal("stackCommand() accepted invalid tunnelLB")
+	}
+	env, _, err := stackCommand(stackReq{Action: "up", TunnelLB: "hash", TunnelMaxIdle: "15s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(env, " ")
+	if !strings.Contains(joined, "EDGE_TUNNEL_LB=hash") {
+		t.Fatalf("env = %v", env)
+	}
+	if !strings.Contains(joined, "EDGE_TUNNEL_MAX_IDLE=15s") {
+		t.Fatalf("env = %v", env)
+	}
+}
+
+func TestAppendBlastArgsOpenLoop(t *testing.T) {
+	args, err := appendBlastArgs(nil, runReq{
+		Mode: "open", RPS: 50, Method: "POST", Body: "hi", Probe0RTT: true,
+		Warmup: "2s", Duration: "10s", MaxInflight: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-mode=open", "-rps=50", "-method=POST", "-body=hi", "-probe-0rtt", "-warmup=2s", "-max-inflight=64"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %s in %v", want, args)
+		}
 	}
 }
