@@ -21,7 +21,7 @@ AKS node pool.
  connector     ← plays cloudflared: accepts request streams, proxies to origin
    │  tcp/8080   plain HTTP/1.1
    ▼
- origin        ← your app: /fast /slow /hang /drip /bytes /reset /flaky
+ origin        ← your app: /fast /slow /hang /drip /bytes /reset /flaky /echo /headers /stall
 ```
 
 ## Quick start
@@ -69,10 +69,11 @@ make smoke       # builds the Docker stack and checks h3, qlog, 524, and 1033
 ```
 
 `make smoke` is intentionally short and deterministic. It starts the stack,
-proves `/fast` negotiates `HTTP/3.0`, verifies qlog files are written, checks a
-slow origin becomes `524`, checks a missing connector becomes `502 / 1033`, and
-then cleans the stack up. Set `KEEP_STACK=1 make smoke` if you want to inspect
-the containers afterward.
+proves `/fast` negotiates `HTTP/3.0`, verifies qlog files are written, then
+checks 524, 1033, origin RST (1014), invisible client-deadline, idle timeout vs
+keepalive, Alt-Svc on the TCP listener, and POST `/echo`. Host `curl --http3-only`
+is used when that curl exists. Set `KEEP_STACK=1 make smoke` if you want to
+inspect the containers afterward.
 
 For local development:
 
@@ -170,8 +171,11 @@ time (100s in production). The edge here does the same thing with a much shorter
 | --- | --- | --- |
 | Slow origin | `make scenario-524` | `524`, `cf-error-code: 524` |
 | Wedged origin (never responds) | `make scenario-hang` | `524` + connector logs the request still in flight |
-| Origin RST | `curl -k --http3-only https://localhost:8443/reset` | `502`, `error code: 1014` |
+| Origin RST | `make scenario-reset` | `502`, `error code: 1014` |
 | Connector down | `docker compose stop connector` then curl | `502`, `error code: 1033` |
+| Invisible failure | `make scenario-invisible` | client `client_deadline`, **no** 524 in blast JSONL |
+| Idle disconnect | `make scenario-idle` | `quic_idle_timeout` with `packets_lost=0` |
+| Keepalive fix | `make scenario-keepalive` | zero connection drops |
 
 Change the deadline to bracket the real behaviour:
 
@@ -228,12 +232,22 @@ backlog with a rate limit, then push volume:
 
 ```sh
 make scenario-buffer
-make udpstats       # Udp: ... RcvbufErrors  <-- this counter is the evidence
+make udpstats       # Udp: ... SndbufErrors  <-- this is the counter that moves here
 ```
 
-`RcvbufErrors` / `SndbufErrors` climbing in `/proc/net/snmp` inside the edge
-container is the smoking gun. The edge also logs deltas every 10s
+`SndbufErrors` climbing in `/proc/net/snmp` inside the edge container is the
+smoking gun on this stack. The edge also logs deltas every 10s
 (`"msg":"udp counters"`), and `blast` prints them per interval on stderr.
+
+`RcvbufErrors` is a different failure: the **receiving** process has to stall
+with a tiny `SO_RCVBUF` while datagrams keep arriving. That has **not** been
+reproduced on Docker Desktop. On native Linux you can try:
+
+```sh
+make rcvbuf-pressure
+```
+
+Treat a zero `RcvbufErrors` counter as inconclusive, not a pass.
 
 A real 15s run at `rate 5mbit` on this stack produced:
 
@@ -275,8 +289,11 @@ Other impairments:
 ## The HTTP/3 harness
 
 `blast` opens N independent QUIC connections (each on its own UDP socket, so
-kernel drops can be attributed to one connection) and runs M concurrent requests
-on each.
+kernel drops can be attributed to one connection). **Closed-loop** (default) runs
+M workers per connection that wait for each response — completed RPS collapses
+when latency rises. **Open-loop** (`-mode=open -rps=N`) starts requests from a
+token bucket so offered load stays put; `omitted` counts ticks dropped because
+`max-inflight` was full.
 
 ```sh
 docker compose run --rm blast blast \
@@ -295,6 +312,22 @@ Useful flags:
 | `-read-body=false` | Abandons response bodies, generating `STOP_SENDING`/stream resets so you can see how the edge reports them. |
 | `-udp-recv-buffer` | Per-socket `SO_RCVBUF` on the client side. |
 | `-conns` / `-workers` | `conns` spreads load over QUIC connections; `workers` multiplexes streams on one connection (this is what exposes head-of-line and flow-control effects). |
+| `-mode` / `-rps` / `-max-inflight` | `closed` (default) waits for responses. `open` requires `-rps` and holds offered load. |
+| `-warmup` | Traffic discarded from the summary so percentiles are not cold-start. |
+| `-body` / `-body-file` / `-method` | Request bodies (POST `/echo` through the tunnel). |
+| `-urls` / `-urls-file` | Mix paths round-robin with `-url`. |
+| `-probe-0rtt` | Dial twice before the run; the second handshake is the 0-RTT attempt. |
+
+Second-stack clients (not quic-go):
+
+```sh
+make curl-h3 URL=https://localhost:8443/fast
+make chrome-h3 URL=https://localhost:8443/fast
+```
+
+Host curl is used when it supports `--http3-only`; otherwise a helper image joins
+the compose network. Chrome is skipped if it is not installed. Blast itself
+advertises **only** `h3`, so it will not silently fall back to HTTP/2.
 
 ### Output
 
@@ -407,6 +440,25 @@ internal/quicerr/      QUIC/HTTP3 error -> stable label
 internal/udpsock/      UDP socket buffers + /proc/net/snmp counters
 scripts/impair.sh      tc netem helpers
 scripts/host-rmem.sh   host-kernel sysctl helper
+scripts/h3-clients.sh  curl --http3-only and headless Chrome
+scripts/rcvbuf-pressure.sh  Linux-only RcvbufErrors attempt
 ```
+
+Tunnel hop knobs (independent of the public HTTP/3 hop):
+
+```sh
+EDGE_TUNNEL_MAX_IDLE=15s EDGE_TUNNEL_KEEPALIVE=2s EDGE_TUNNEL_LB=hash \
+  docker compose up -d --force-recreate edge
+```
+
+`EDGE_TUNNEL_LB=hash` pins a request path to one connector so you can see
+whether drops follow a replica. `rr` is the default.
+
+## Still out of scope
+
+This is a tunnel-path failure lab, not an HTTP/3 conformance suite. It does not
+implement WebTransport, HTTP datagrams, CONNECT-UDP/MASQUE, connection migration,
+QUIC v2 / retry / key-update tests, PMTUD, ECN, or a live qvis panel. qlog files
+plus `tcpdump` remain the escape hatch for frame-level work.
 
 Build without Docker: `go build ./cmd/quicshot`.
