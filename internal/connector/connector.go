@@ -163,11 +163,12 @@ func serveStream(log *slog.Logger, str *quic.Stream, originURL string, client *h
 				"target", target, "elapsed_ms", time.Since(start).Milliseconds())
 			return
 		}
-		// The edge has almost certainly already given up and returned a 524; this
-		// log line is what proves the origin, not the tunnel, was the slow part.
+		// Origin connection errors (RST, dial fail) must surface as a broken
+		// tunnel response so the edge can synthesize Cloudflare 1014. Writing a
+		// bare 502 here would be proxied through and lose the cf error code.
 		log.Warn("origin request failed", "stream", int64(str.StreamID()), "target", target,
 			"elapsed_ms", time.Since(start).Milliseconds(), "err", err.Error())
-		writeStatus(str, http.StatusBadGateway)
+		str.CancelWrite(0)
 		return
 	}
 	defer resp.Body.Close()
