@@ -163,3 +163,32 @@ func TestAppendBlastArgsOpenLoop(t *testing.T) {
 		}
 	}
 }
+
+func TestAppendBlastArgsOmitsDefaultNewFlags(t *testing.T) {
+	args, err := appendBlastArgs(nil, runReq{
+		Mode: "closed", Method: "GET", Warmup: "0s", Duration: "10s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, bad := range []string{"-warmup=", "-mode=", "-method=", "-probe-0rtt", "-max-inflight="} {
+		if strings.Contains(joined, bad) {
+			t.Fatalf("default blast should omit %s: %v", bad, args)
+		}
+	}
+	if !strings.Contains(joined, "-duration=10s") {
+		t.Fatalf("missing duration in %v", args)
+	}
+}
+
+func TestResolveRunCommandRebuildsComposeImage(t *testing.T) {
+	_, argv, err := resolveRunCommand("docker", []string{"blast", "-url=https://edge:8443/fast"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "compose run --build --rm -T blast") {
+		t.Fatalf("expected compose run --build, got %v", argv)
+	}
+}

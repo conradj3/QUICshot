@@ -958,10 +958,11 @@ func stackCommand(req stackReq) ([]string, []string, error) {
 }
 
 var (
-	durationRE = regexp.MustCompile(`^[0-9]+(ms|s|m)$`)
-	netemArgRE = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(%|ms|s|kbit|mbit|gbit)$`)
-	services   = map[string]bool{"edge": true, "connector": true, "origin": true}
-	netemModes = map[string]bool{"loss": true, "delay": true, "rate": true, "reorder": true, "clear": true}
+	durationRE     = regexp.MustCompile(`^[0-9]+(ms|s|m)$`)
+	zeroDurationRE = regexp.MustCompile(`^0+(ms|s|m)$`)
+	netemArgRE     = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(%|ms|s|kbit|mbit|gbit)$`)
+	services       = map[string]bool{"edge": true, "connector": true, "origin": true}
+	netemModes     = map[string]bool{"loss": true, "delay": true, "rate": true, "reorder": true, "clear": true}
 )
 
 type impairReq struct {
@@ -1093,42 +1094,35 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
+	bin, argv, err := planRun(s.dir, req, target)
+	if err != nil {
+		httpErr(w, err)
+		return
+	}
+	s.startLogged(w, req.Tool, bin, argv)
+}
 
+func planRun(dir string, req runReq, target string) (string, []string, error) {
 	if req.Tool == "curl" || req.Tool == "chrome" {
-		script := filepath.Join(s.dir, "scripts", "h3-clients.sh")
+		script := filepath.Join(dir, "scripts", "h3-clients.sh")
 		argv := []string{req.Tool, target}
 		if req.Insecure || req.LocalCerts {
 			argv = append(argv, "--insecure")
 		}
-		err = s.start(req.Tool, func(ctx context.Context) {
-			s.log("ui", "$ "+script+" "+strings.Join(argv, " "))
-			if err := s.runStreaming(ctx, req.Tool, nil, script, argv...); err != nil {
-				s.log(req.Tool, "exit: "+err.Error())
-			}
-		})
-		if err != nil {
-			httpErr(w, err)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-		return
+		return script, argv, nil
 	}
-
 	toolArgs, err := buildRunArgs(req, target)
 	if err != nil {
-		httpErr(w, err)
-		return
+		return "", nil, err
 	}
-	name, argv, err := resolveRunCommand(req.Runner, toolArgs)
-	if err != nil {
-		httpErr(w, err)
-		return
-	}
+	return resolveRunCommand(req.Runner, toolArgs)
+}
 
-	err = s.start(req.Tool, func(ctx context.Context) {
-		s.log("ui", "$ "+name+" "+strings.Join(argv, " "))
-		if err := s.runStreaming(ctx, req.Tool, nil, name, argv...); err != nil {
-			s.log(req.Tool, "exit: "+err.Error())
+func (s *Server) startLogged(w http.ResponseWriter, src, bin string, argv []string) {
+	err := s.start(src, func(ctx context.Context) {
+		s.log("ui", "$ "+bin+" "+strings.Join(argv, " "))
+		if err := s.runStreaming(ctx, src, nil, bin, argv...); err != nil {
+			s.log(src, "exit: "+err.Error())
 		}
 	})
 	if err != nil {
@@ -1180,14 +1174,27 @@ func appendRunHeaders(args []string, headers []string) []string {
 }
 
 func appendBlastArgs(args []string, req runReq) ([]string, error) {
-	blastDurations := [][2]string{
+	args, err := appendDurationFlags(args, req)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args,
+		"-conns="+strconv.Itoa(clamp(req.Conns, 1, 64)),
+		"-workers="+strconv.Itoa(clamp(req.Workers, 1, 256)),
+		"-stats-every=5s",
+		"-read-body="+strconv.FormatBool(req.ReadBody),
+	)
+	return appendOptionalBlastFlags(args, req)
+}
+
+func appendDurationFlags(args []string, req runReq) ([]string, error) {
+	pairs := [][2]string{
 		{"-duration=", req.Duration},
 		{"-timeout=", req.Timeout},
 		{"-keepalive=", req.KeepAlive},
 		{"-max-idle-timeout=", req.MaxIdle},
-		{"-warmup=", req.Warmup},
 	}
-	for _, kv := range blastDurations {
+	for _, kv := range pairs {
 		if kv[1] == "" {
 			continue
 		}
@@ -1196,22 +1203,30 @@ func appendBlastArgs(args []string, req runReq) ([]string, error) {
 		}
 		args = append(args, kv[0]+kv[1])
 	}
-	args = append(args,
-		"-conns="+strconv.Itoa(clamp(req.Conns, 1, 64)),
-		"-workers="+strconv.Itoa(clamp(req.Workers, 1, 256)),
-		"-stats-every=5s",
-		"-read-body="+strconv.FormatBool(req.ReadBody),
-	)
+	return appendWarmupFlag(args, req.Warmup)
+}
+
+func appendWarmupFlag(args []string, warmup string) ([]string, error) {
+	if warmup == "" || zeroDuration(warmup) {
+		return args, nil
+	}
+	if !durationRE.MatchString(warmup) {
+		return nil, fmt.Errorf("-warmup= expected a duration like 2s")
+	}
+	return append(args, "-warmup="+warmup), nil
+}
+
+func appendOptionalBlastFlags(args []string, req runReq) ([]string, error) {
 	if req.RPS > 0 {
 		args = append(args, "-rps="+strconv.FormatFloat(req.RPS, 'f', -1, 64))
 	}
-	if req.Mode == "open" || req.Mode == "closed" {
-		args = append(args, "-mode="+req.Mode)
+	if req.Mode == "open" {
+		args = append(args, "-mode=open")
 	}
 	if req.MaxInflight > 0 {
 		args = append(args, "-max-inflight="+strconv.Itoa(clamp(req.MaxInflight, 1, 4096)))
 	}
-	if req.Method != "" {
+	if req.Method != "" && !strings.EqualFold(req.Method, http.MethodGet) {
 		args = append(args, "-method="+req.Method)
 	}
 	if req.Body != "" {
@@ -1226,6 +1241,10 @@ func appendBlastArgs(args []string, req runReq) ([]string, error) {
 	return args, nil
 }
 
+func zeroDuration(s string) bool {
+	return zeroDurationRE.MatchString(s)
+}
+
 func resolveRunCommand(runner string, toolArgs []string) (string, []string, error) {
 	if runner == "host" {
 		self, err := os.Executable()
@@ -1234,7 +1253,7 @@ func resolveRunCommand(runner string, toolArgs []string) (string, []string, erro
 		}
 		return self, toolArgs, nil
 	}
-	return "docker", append([]string{"compose", "run", "--rm", "-T", "blast"}, toolArgs...), nil
+	return "docker", append([]string{"compose", "run", "--build", "--rm", "-T", "blast"}, toolArgs...), nil
 }
 
 func safeURL(s string) (string, error) {
