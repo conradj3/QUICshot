@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +68,7 @@ func Main(args []string) error {
 	go s.tailLogs("connector")
 	go s.pollConnectors()
 	go s.pollUDP()
+	go s.pollServiceHealth()
 	go s.publishFlow()
 
 	fmt.Printf("\n  QUICshot control panel:  http://%s\n\n", addr)
@@ -86,6 +88,9 @@ type Server struct {
 	rate map[string]*bucket
 
 	flow flowState
+
+	healthMu sync.Mutex
+	health   map[string]serviceHealth
 }
 
 // flowState is derived from the containers' own log lines so the diagram stays
@@ -96,17 +101,41 @@ type flowState struct {
 	tunnelKnown  bool // false until traffic or a register/lost line tells us
 	connectors   int
 	connectorReq map[int]int64
+	connectorP95 map[int]int64
+	connectorP99 map[int]int64
+	connectorErr map[int]int64
 	impair       string
 	clientReq    int64
 	clientFail   int64
 
-	edgeReq, edge524, edge502 int64 // totals
-	dReq, d524, d502          int64 // this interval
-	sumMs, cntMs              int64
+	edgeReq, edge524, edge502 int64   // totals
+	dReq, d524, d502          int64   // this interval
+	edgeLatency               []int64 // this interval latency samples in ms
+
+	connOpened, connClosed           int64
+	connOpenedTotal, connClosedTotal int64
+	connDropsTotal                   int64
+	activeConns                      int64
+
+	quicVersions  map[string]int64
+	protos        map[string]int64
+	zeroRTTAccept int64
+	zeroRTTReject int64
+
+	connectorLat map[int][]int64
+}
+
+type serviceHealth struct {
+	CPU      float64 `json:"cpu"`
+	Mem      float64 `json:"mem"`
+	Replicas int     `json:"replicas"`
+	Updated  int64   `json:"updated"`
 }
 
 var (
 	blastTotalRE  = regexp.MustCompile(`total=(\d+) fail=(\d+)`)
+	connDropRE    = regexp.MustCompile(`^conn drops\s+(\d+)`)
+	protoLineRE   = regexp.MustCompile(`^\s*(HTTP/\d\.\d)\s+(\d+)`)
 	statusRE      = regexp.MustCompile(`"status":(\d+)`)
 	elapsedRE     = regexp.MustCompile(`"elapsed_ms":(\d+)`)
 	connectorsRE  = regexp.MustCompile(`"connectors":(\d+)`)
@@ -119,8 +148,19 @@ func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
 
 // observe runs on every log line, before rate limiting.
 func (s *Server) observe(src, line string) {
+	if src == "blast" {
+		s.observeBlast(src, line)
+		return
+	}
+	if !isEdgeJSON(src, line) {
+		return
+	}
+	s.observeEdgeLine(line)
+}
+
+func (s *Server) observeBlast(_ string, line string) {
 	f := &s.flow
-	if src == "blast" && strings.HasPrefix(line, "[blast]") {
+	if strings.HasPrefix(line, "[blast]") {
 		if m := blastTotalRE.FindStringSubmatch(line); m != nil {
 			f.mu.Lock()
 			f.clientReq, f.clientFail = atoi64(m[1]), atoi64(m[2])
@@ -128,68 +168,238 @@ func (s *Server) observe(src, line string) {
 		}
 		return
 	}
-	if src != "edge" || len(line) == 0 || line[0] != '{' {
-		return
-	}
+	s.observeBlastLine(line)
+}
 
+func isEdgeJSON(src, line string) bool {
+	return src == "edge" && len(line) > 0 && line[0] == '{'
+}
+
+func (s *Server) observeEdgeLine(line string) {
 	switch {
 	case strings.Contains(line, `"msg":"proxied"`):
-		var ms int64
-		if m := elapsedRE.FindStringSubmatch(line); m != nil {
-			ms = atoi64(m[1])
-		}
-		connectorID := 0
-		if m := connectorIDRE.FindStringSubmatch(line); m != nil {
-			connectorID = atoi(m[1])
-		}
-		f.mu.Lock()
-		if f.connectorReq == nil {
-			f.connectorReq = map[int]int64{}
-		}
-		f.edgeReq++
-		f.dReq++
-		f.sumMs += ms
-		f.cntMs++
-		if connectorID > 0 {
-			f.connectorReq[connectorID]++
-		}
-		f.tunnelUp, f.tunnelKnown = true, true // a proxied request proves the tunnel works
-		f.mu.Unlock()
+		s.observeEdgeProxied(line)
 	case strings.Contains(line, `"msg":"origin failure"`):
-		var st int64
-		if m := statusRE.FindStringSubmatch(line); m != nil {
-			st = atoi64(m[1])
-		}
-		f.mu.Lock()
-		f.edgeReq++
-		f.dReq++
-		if st == statusOriginTimeout {
-			f.edge524++
-			f.d524++
-			f.tunnelUp, f.tunnelKnown = true, true // reached the origin, so the tunnel is up
-		} else {
-			f.edge502++
-			f.d502++
-		}
-		f.mu.Unlock()
+		s.observeEdgeOriginFailure(line)
 	case strings.Contains(line, `"msg":"no connector"`):
-		f.mu.Lock()
-		f.edgeReq++
-		f.dReq++
+		s.observeEdgeNoConnector()
+	case strings.Contains(line, `"msg":"connector registered"`), strings.Contains(line, `"msg":"connector lost"`):
+		s.observeEdgeConnectorState(line)
+	}
+}
+
+func (s *Server) observeEdgeProxied(line string) {
+	f := &s.flow
+	ms := extractElapsedMs(line)
+	connectorID := extractConnectorID(line)
+
+	f.mu.Lock()
+	f.edgeReq++
+	f.dReq++
+	f.edgeLatency = appendSample(f.edgeLatency, ms, 1024)
+	if connectorID > 0 {
+		ensureConnectorMaps(f)
+		f.connectorReq[connectorID]++
+		f.connectorLat[connectorID] = appendSample(f.connectorLat[connectorID], ms, 512)
+	}
+	f.tunnelUp, f.tunnelKnown = true, true // a proxied request proves the tunnel works
+	f.mu.Unlock()
+}
+
+func (s *Server) observeEdgeOriginFailure(line string) {
+	f := &s.flow
+	status := extractStatus(line)
+	connectorID := extractConnectorID(line)
+
+	f.mu.Lock()
+	f.edgeReq++
+	f.dReq++
+	if status == statusOriginTimeout {
+		f.edge524++
+		f.d524++
+		f.tunnelUp, f.tunnelKnown = true, true // reached the origin, so the tunnel is up
+	} else {
 		f.edge502++
 		f.d502++
-		f.tunnelUp, f.tunnelKnown, f.connectors = false, true, 0
-		f.mu.Unlock()
-	case strings.Contains(line, `"msg":"connector registered"`), strings.Contains(line, `"msg":"connector lost"`):
-		n := int64(0)
-		if m := connectorsRE.FindStringSubmatch(line); m != nil {
-			n = atoi64(m[1])
-		}
-		f.mu.Lock()
-		f.connectors = int(n)
-		f.tunnelUp, f.tunnelKnown = n > 0, true
-		f.mu.Unlock()
 	}
+	if connectorID > 0 {
+		if f.connectorErr == nil {
+			f.connectorErr = map[int]int64{}
+		}
+		f.connectorErr[connectorID]++
+	}
+	f.mu.Unlock()
+}
+
+func (s *Server) observeEdgeNoConnector() {
+	f := &s.flow
+	f.mu.Lock()
+	f.edgeReq++
+	f.dReq++
+	f.edge502++
+	f.d502++
+	f.tunnelUp, f.tunnelKnown, f.connectors = false, true, 0
+	f.mu.Unlock()
+}
+
+func (s *Server) observeEdgeConnectorState(line string) {
+	f := &s.flow
+	n := int64(0)
+	if m := connectorsRE.FindStringSubmatch(line); m != nil {
+		n = atoi64(m[1])
+	}
+	f.mu.Lock()
+	f.connectors = int(n)
+	f.tunnelUp, f.tunnelKnown = n > 0, true
+	f.mu.Unlock()
+}
+
+func extractElapsedMs(line string) int64 {
+	if m := elapsedRE.FindStringSubmatch(line); m != nil {
+		return atoi64(m[1])
+	}
+	return 0
+}
+
+func extractConnectorID(line string) int {
+	if m := connectorIDRE.FindStringSubmatch(line); m != nil {
+		return atoi(m[1])
+	}
+	return 0
+}
+
+func extractStatus(line string) int64 {
+	if m := statusRE.FindStringSubmatch(line); m != nil {
+		return atoi64(m[1])
+	}
+	return 0
+}
+
+func ensureConnectorMaps(f *flowState) {
+	if f.connectorReq == nil {
+		f.connectorReq = map[int]int64{}
+	}
+	if f.connectorLat == nil {
+		f.connectorLat = map[int][]int64{}
+	}
+}
+
+func (s *Server) observeBlastLine(line string) {
+	if s.observeBlastJSONLine(line) {
+		return
+	}
+	if s.observeBlastConnDrop(line) {
+		return
+	}
+	s.observeBlastProtocolLine(line)
+}
+
+func (s *Server) observeBlastJSONLine(line string) bool {
+	if len(line) == 0 || line[0] != '{' {
+		return false
+	}
+	var ev struct {
+		Event    string `json:"event"`
+		Version  string `json:"quic_version"`
+		Used0RTT bool   `json:"used_0rtt"`
+	}
+	if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		return false
+	}
+	s.applyBlastEvent(ev.Event, ev.Version, ev.Used0RTT)
+	return true
+}
+
+func (s *Server) applyBlastEvent(eventName, version string, used0RTT bool) {
+	f := &s.flow
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	switch eventName {
+	case "conn_open":
+		f.connOpened++
+		f.connOpenedTotal++
+		f.activeConns++
+		if f.quicVersions == nil {
+			f.quicVersions = map[string]int64{}
+		}
+		if version != "" {
+			f.quicVersions[version]++
+		}
+		if used0RTT {
+			f.zeroRTTAccept++
+		} else {
+			f.zeroRTTReject++
+		}
+	case "conn_closed":
+		f.connClosed++
+		f.connClosedTotal++
+		if f.activeConns > 0 {
+			f.activeConns--
+		}
+		f.connDropsTotal++
+	}
+}
+
+func (s *Server) observeBlastConnDrop(line string) bool {
+	m := connDropRE.FindStringSubmatch(strings.TrimSpace(line))
+	if m == nil {
+		return false
+	}
+	f := &s.flow
+	f.mu.Lock()
+	f.connDropsTotal = atoi64(m[1])
+	f.mu.Unlock()
+	return true
+}
+
+func (s *Server) observeBlastProtocolLine(line string) {
+	m := protoLineRE.FindStringSubmatch(line)
+	if m == nil {
+		return
+	}
+	f := &s.flow
+	f.mu.Lock()
+	if f.protos == nil {
+		f.protos = map[string]int64{}
+	}
+	f.protos[m[1]] = atoi64(m[2])
+	f.mu.Unlock()
+}
+
+func appendSample(samples []int64, v int64, keep int) []int64 {
+	samples = append(samples, v)
+	if len(samples) > keep {
+		samples = append([]int64{}, samples[len(samples)-keep:]...)
+	}
+	return samples
+}
+
+func percentileMs(samples []int64, p float64) int64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	cpy := append([]int64{}, samples...)
+	sort.Slice(cpy, func(i, j int) bool { return cpy[i] < cpy[j] })
+	idx := int((p / 100.0) * float64(len(cpy)-1))
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(cpy) {
+		idx = len(cpy) - 1
+	}
+	return cpy[idx]
+}
+
+func avgMs(samples []int64) int64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	var sum int64
+	for _, n := range samples {
+		sum += n
+	}
+	return sum / int64(len(samples))
 }
 
 // statusOriginTimeout mirrors the edge's non-standard 524.
@@ -201,27 +411,65 @@ func (s *Server) publishFlow() {
 	for range t.C {
 		f := &s.flow
 		f.mu.Lock()
-		var p50 int64
-		if f.cntMs > 0 {
-			p50 = f.sumMs / f.cntMs
-		}
+		p50 := percentileMs(f.edgeLatency, 50)
+		p95 := percentileMs(f.edgeLatency, 95)
+		p99 := percentileMs(f.edgeLatency, 99)
+		avg := avgMs(f.edgeLatency)
 		connectorReq := map[int]int64{}
 		for id, n := range f.connectorReq {
 			connectorReq[id] = n
 		}
+		connectorP95 := map[int]int64{}
+		connectorP99 := map[int]int64{}
+		for id, lats := range f.connectorLat {
+			connectorP95[id] = percentileMs(lats, 95)
+			connectorP99[id] = percentileMs(lats, 99)
+		}
+		connectorErr := map[int]int64{}
+		for id, n := range f.connectorErr {
+			connectorErr[id] = n
+		}
+		versions := map[string]int64{}
+		for k, v := range f.quicVersions {
+			versions[k] = v
+		}
+		protos := map[string]int64{}
+		for k, v := range f.protos {
+			protos[k] = v
+		}
+		health := s.healthSnapshot()
 		msg := map[string]any{
 			"t":      "flow",
 			"client": map[string]any{"req": f.clientReq, "fail": f.clientFail},
 			"edge": map[string]any{"rps": f.dReq, "s524": f.d524, "s502": f.d502,
-				"total": f.edgeReq, "t524": f.edge524, "t502": f.edge502, "avgMs": p50},
-			"tunnel": map[string]any{"up": f.tunnelUp, "n": f.connectors, "known": f.tunnelKnown, "connectorReq": connectorReq},
+				"total": f.edgeReq, "t524": f.edge524, "t502": f.edge502,
+				"avgMs": avg, "p50Ms": p50, "p95Ms": p95, "p99Ms": p99},
+			"tunnel": map[string]any{"up": f.tunnelUp, "n": f.connectors, "known": f.tunnelKnown,
+				"connectorReq": connectorReq, "connectorP95": connectorP95, "connectorP99": connectorP99, "connectorErr": connectorErr},
 			"origin": map[string]any{"rps": f.dReq - f.d502},
+			"lifecycle": map[string]any{"active": f.activeConns, "openSec": f.connOpened, "closedSec": f.connClosed,
+				"openTotal": f.connOpenedTotal, "closedTotal": f.connClosedTotal, "dropsTotal": f.connDropsTotal},
+			"protocol": map[string]any{"versions": versions, "negotiated": protos,
+				"zeroRTTAccept": f.zeroRTTAccept, "zeroRTTReject": f.zeroRTTReject},
+			"health": health,
 			"impair": f.impair,
 		}
-		f.dReq, f.d524, f.d502, f.sumMs, f.cntMs = 0, 0, 0, 0, 0
+		f.dReq, f.d524, f.d502 = 0, 0, 0
+		f.connOpened, f.connClosed = 0, 0
+		f.edgeLatency = nil
 		f.mu.Unlock()
 		s.hub.publish(msg)
 	}
+}
+
+func (s *Server) healthSnapshot() map[string]serviceHealth {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	out := map[string]serviceHealth{}
+	for k, v := range s.health {
+		out[k] = v
+	}
+	return out
 }
 
 // A blast can emit tens of thousands of lines a second, which would drown the
@@ -406,38 +654,59 @@ func (s *Server) pollUDP() {
 	var prev counters
 	for {
 		time.Sleep(3 * time.Second)
-		cmd := exec.Command("docker", "compose", "exec", "-T", "edge", "cat", "/proc/net/snmp")
-		cmd.Dir = s.dir
-		out, err := cmd.Output()
-		if err != nil {
+		cur, ok := s.readUDPCounters()
+		if !ok {
 			continue
 		}
-		var hdr []string
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.HasPrefix(line, "Udp:") {
-				continue
-			}
-			f := strings.Fields(line)
-			if hdr == nil {
-				hdr = f
-				continue
-			}
-			vals := map[string]uint64{}
-			for i := 1; i < len(f) && i < len(hdr); i++ {
-				n, _ := strconv.ParseUint(f[i], 10, 64)
-				vals[hdr[i]] = n
-			}
-			cur := counters{vals["InDatagrams"], vals["OutDatagrams"], vals["RcvbufErrors"], vals["SndbufErrors"]}
-			if prev != (counters{}) {
-				s.hub.publish(map[string]any{"t": "udp",
-					"in": cur.in - prev.in, "out": cur.out - prev.out,
-					"rcvbuf": cur.rcv - prev.rcv, "sndbuf": cur.snd - prev.snd,
-					"rcvbufTotal": cur.rcv, "sndbufTotal": cur.snd})
-			}
-			prev = cur
-			break
+		if prev != (counters{}) {
+			s.publishUDPDelta(prev, cur)
 		}
+		prev = cur
 	}
+}
+
+func (s *Server) readUDPCounters() (struct{ in, out, rcv, snd uint64 }, bool) {
+	type counters struct{ in, out, rcv, snd uint64 }
+	cmd := exec.Command("docker", "compose", "exec", "-T", "edge", "cat", "/proc/net/snmp")
+	cmd.Dir = s.dir
+	out, err := cmd.Output()
+	if err != nil {
+		return counters{}, false
+	}
+	cur, ok := parseUDPSNMP(string(out))
+	if !ok {
+		return counters{}, false
+	}
+	return cur, true
+}
+
+func parseUDPSNMP(snmp string) (struct{ in, out, rcv, snd uint64 }, bool) {
+	type counters struct{ in, out, rcv, snd uint64 }
+	var hdr []string
+	for _, line := range strings.Split(snmp, "\n") {
+		if !strings.HasPrefix(line, "Udp:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if hdr == nil {
+			hdr = fields
+			continue
+		}
+		vals := map[string]uint64{}
+		for i := 1; i < len(fields) && i < len(hdr); i++ {
+			n, _ := strconv.ParseUint(fields[i], 10, 64)
+			vals[hdr[i]] = n
+		}
+		return counters{vals["InDatagrams"], vals["OutDatagrams"], vals["RcvbufErrors"], vals["SndbufErrors"]}, true
+	}
+	return counters{}, false
+}
+
+func (s *Server) publishUDPDelta(prev, cur struct{ in, out, rcv, snd uint64 }) {
+	s.hub.publish(map[string]any{"t": "udp",
+		"in": cur.in - prev.in, "out": cur.out - prev.out,
+		"rcvbuf": cur.rcv - prev.rcv, "sndbuf": cur.snd - prev.snd,
+		"rcvbufTotal": cur.rcv, "sndbufTotal": cur.snd})
 }
 
 func (s *Server) pollConnectors() {
@@ -456,6 +725,81 @@ func (s *Server) pollConnectors() {
 		s.flow.tunnelUp = n > 0
 		s.flow.mu.Unlock()
 	}
+}
+
+func (s *Server) pollServiceHealth() {
+	for {
+		time.Sleep(3 * time.Second)
+		s.updateServiceHealth("edge")
+		s.updateServiceHealth("connector")
+		s.updateServiceHealth("origin")
+	}
+}
+
+func (s *Server) updateServiceHealth(service string) {
+	cmd := exec.Command("docker", "compose", "ps", "-q", "--status", "running", service)
+	cmd.Dir = s.dir
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+	ids := []string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		id := strings.TrimSpace(line)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		s.setServiceHealth(service, serviceHealth{Replicas: 0, Updated: time.Now().Unix()})
+		return
+	}
+
+	args := append([]string{"stats", "--no-stream", "--format", "{{.CPUPerc}}|{{.MemPerc}}"}, ids...)
+	statsCmd := exec.Command("docker", args...)
+	statsCmd.Dir = s.dir
+	statsOut, err := statsCmd.Output()
+	if err != nil {
+		return
+	}
+
+	maxCPU := 0.0
+	maxMem := 0.0
+	for _, line := range strings.Split(string(statsOut), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) < 2 {
+			continue
+		}
+		cpu := parsePercent(parts[0])
+		mem := parsePercent(parts[1])
+		if cpu > maxCPU {
+			maxCPU = cpu
+		}
+		if mem > maxMem {
+			maxMem = mem
+		}
+	}
+
+	s.setServiceHealth(service, serviceHealth{CPU: maxCPU, Mem: maxMem, Replicas: len(ids), Updated: time.Now().Unix()})
+}
+
+func (s *Server) setServiceHealth(service string, health serviceHealth) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	if s.health == nil {
+		s.health = map[string]serviceHealth{}
+	}
+	s.health[service] = health
+}
+
+func parsePercent(s string) float64 {
+	s = strings.TrimSpace(strings.TrimSuffix(s, "%"))
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
 }
 
 func countLines(s string) int {
@@ -512,8 +856,18 @@ func (s *Server) resetFlow() {
 	s.flow.clientReq, s.flow.clientFail = 0, 0
 	s.flow.edgeReq, s.flow.edge524, s.flow.edge502 = 0, 0, 0
 	s.flow.dReq, s.flow.d524, s.flow.d502 = 0, 0, 0
-	s.flow.sumMs, s.flow.cntMs = 0, 0
+	s.flow.edgeLatency = nil
 	s.flow.connectorReq = map[int]int64{}
+	s.flow.connectorLat = map[int][]int64{}
+	s.flow.connectorErr = map[int]int64{}
+	s.flow.connectorP95 = map[int]int64{}
+	s.flow.connectorP99 = map[int]int64{}
+	s.flow.connOpened, s.flow.connClosed = 0, 0
+	s.flow.connOpenedTotal, s.flow.connClosedTotal, s.flow.connDropsTotal = 0, 0, 0
+	s.flow.activeConns = 0
+	s.flow.quicVersions = map[string]int64{}
+	s.flow.protos = map[string]int64{}
+	s.flow.zeroRTTAccept, s.flow.zeroRTTReject = 0, 0
 }
 
 // ---------------------------------------------------------------- API handlers
@@ -603,6 +957,7 @@ type impairReq struct {
 	Mode    string `json:"mode"`
 	A       string `json:"a"`
 	B       string `json:"b"`
+	Burst   string `json:"burst"`
 }
 
 func (s *Server) handleImpair(w http.ResponseWriter, r *http.Request) {
@@ -611,38 +966,10 @@ func (s *Server) handleImpair(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	if !services[req.Service] || !netemModes[req.Mode] {
-		httpErr(w, errors.New("unknown service or mode"))
+	tc, err := buildImpairCommand(req)
+	if err != nil {
+		httpErr(w, err)
 		return
-	}
-	tc := []string{"compose", "exec", "-T", req.Service, "tc", "qdisc"}
-	switch req.Mode {
-	case "clear":
-		tc = append(tc, "del", "dev", "eth0", "root")
-	default:
-		for _, v := range []string{req.A, req.B} {
-			if v != "" && !netemArgRE.MatchString(v) {
-				httpErr(w, fmt.Errorf("bad netem value %q", v))
-				return
-			}
-		}
-		tc = append(tc, "replace", "dev", "eth0", "root", "netem")
-		switch req.Mode {
-		case "loss":
-			tc = append(tc, "loss", req.A)
-		case "rate":
-			tc = append(tc, "rate", req.A, "limit", "100")
-		case "delay":
-			tc = append(tc, "delay", req.A)
-			if req.B != "" {
-				tc = append(tc, req.B, "distribution", "normal")
-			}
-		case "reorder":
-			tc = append(tc, "delay", "10ms", "reorder", req.A)
-			if req.B != "" {
-				tc = append(tc, req.B)
-			}
-		}
 	}
 	name := "impair:" + req.Service + ":" + req.Mode
 	if err := s.start(name, func(ctx context.Context) {
@@ -662,6 +989,57 @@ func (s *Server) handleImpair(w http.ResponseWriter, r *http.Request) {
 	}
 	s.flow.mu.Unlock()
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func buildImpairCommand(req impairReq) ([]string, error) {
+	if !services[req.Service] || !netemModes[req.Mode] {
+		return nil, errors.New("unknown service or mode")
+	}
+	tc := []string{"compose", "exec", "-T", req.Service, "tc", "qdisc"}
+	if req.Mode == "clear" {
+		return append(tc, "del", "dev", "eth0", "root"), nil
+	}
+	if err := validateNetemInput(req); err != nil {
+		return nil, err
+	}
+	tc = append(tc, "replace", "dev", "eth0", "root", "netem")
+	return append(tc, netemModeArgs(req)...), nil
+}
+
+func validateNetemInput(req impairReq) error {
+	for _, v := range []string{req.A, req.B, req.Burst} {
+		if v != "" && !netemArgRE.MatchString(v) {
+			return fmt.Errorf("bad netem value %q", v)
+		}
+	}
+	return nil
+}
+
+func netemModeArgs(req impairReq) []string {
+	switch req.Mode {
+	case "loss":
+		args := []string{"loss", req.A}
+		if req.Burst != "" {
+			args = append(args, req.Burst)
+		}
+		return args
+	case "rate":
+		return []string{"rate", req.A, "limit", "100"}
+	case "delay":
+		args := []string{"delay", req.A}
+		if req.B != "" {
+			args = append(args, req.B, "distribution", "normal")
+		}
+		return args
+	case "reorder":
+		args := []string{"delay", "10ms", "reorder", req.A}
+		if req.B != "" {
+			args = append(args, req.B)
+		}
+		return args
+	default:
+		return nil
+	}
 }
 
 type runReq struct {
@@ -692,65 +1070,20 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, err)
 		return
 	}
-	if req.Tool != "blast" && req.Tool != "probe" {
-		httpErr(w, errors.New("tool must be blast or probe"))
+	if err := validateRunRequest(req); err != nil {
+		httpErr(w, err)
 		return
 	}
 
-	toolArgs := []string{req.Tool, "-url=" + target}
-	for _, h := range req.Headers {
-		if h == "" {
-			continue
-		}
-		if !strings.Contains(h, ":") || strings.ContainsAny(h, "\r\n") {
-			httpErr(w, fmt.Errorf("bad header %q", h))
-			return
-		}
-		toolArgs = append(toolArgs, "-header="+h)
+	toolArgs, err := buildRunArgs(req, target)
+	if err != nil {
+		httpErr(w, err)
+		return
 	}
-	if req.Insecure {
-		toolArgs = append(toolArgs, "-insecure")
-	}
-	if req.LocalCerts {
-		toolArgs = append(toolArgs, "-certs=/certs", "-server-name=edge")
-	}
-	if req.Tool == "blast" {
-		for _, kv := range [][2]string{
-			{"-duration=", req.Duration}, {"-timeout=", req.Timeout},
-			{"-keepalive=", req.KeepAlive}, {"-max-idle-timeout=", req.MaxIdle},
-		} {
-			if kv[1] == "" {
-				continue
-			}
-			if !durationRE.MatchString(kv[1]) {
-				httpErr(w, fmt.Errorf("%s expected a duration like 30s", kv[0]))
-				return
-			}
-			toolArgs = append(toolArgs, kv[0]+kv[1])
-		}
-		toolArgs = append(toolArgs,
-			"-conns="+strconv.Itoa(clamp(req.Conns, 1, 64)),
-			"-workers="+strconv.Itoa(clamp(req.Workers, 1, 256)),
-			"-stats-every=5s",
-			"-read-body="+strconv.FormatBool(req.ReadBody),
-		)
-		if req.RPS > 0 {
-			toolArgs = append(toolArgs, "-rps="+strconv.FormatFloat(req.RPS, 'f', -1, 64))
-		}
-	}
-
-	var name string
-	var argv []string
-	if req.Runner == "host" {
-		self, err := os.Executable()
-		if err != nil {
-			httpErr(w, err)
-			return
-		}
-		name, argv = self, toolArgs
-	} else {
-		name = "docker"
-		argv = append([]string{"compose", "run", "--rm", "-T", "blast"}, toolArgs...)
+	name, argv, err := resolveRunCommand(req.Runner, toolArgs)
+	if err != nil {
+		httpErr(w, err)
+		return
 	}
 
 	err = s.start(req.Tool, func(ctx context.Context) {
@@ -764,6 +1097,84 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func validateRunRequest(req runReq) error {
+	if req.Tool != "blast" && req.Tool != "probe" {
+		return errors.New("tool must be blast or probe")
+	}
+	for _, h := range req.Headers {
+		if h == "" {
+			continue
+		}
+		if !strings.Contains(h, ":") || strings.ContainsAny(h, "\r\n") {
+			return fmt.Errorf("bad header %q", h)
+		}
+	}
+	return nil
+}
+
+func buildRunArgs(req runReq, target string) ([]string, error) {
+	toolArgs := []string{req.Tool, "-url=" + target}
+	toolArgs = appendRunHeaders(toolArgs, req.Headers)
+	if req.Insecure {
+		toolArgs = append(toolArgs, "-insecure")
+	}
+	if req.LocalCerts {
+		toolArgs = append(toolArgs, "-certs=/certs", "-server-name=edge")
+	}
+	if req.Tool != "blast" {
+		return toolArgs, nil
+	}
+	return appendBlastArgs(toolArgs, req)
+}
+
+func appendRunHeaders(args []string, headers []string) []string {
+	for _, h := range headers {
+		if h != "" {
+			args = append(args, "-header="+h)
+		}
+	}
+	return args
+}
+
+func appendBlastArgs(args []string, req runReq) ([]string, error) {
+	blastDurations := [][2]string{
+		{"-duration=", req.Duration},
+		{"-timeout=", req.Timeout},
+		{"-keepalive=", req.KeepAlive},
+		{"-max-idle-timeout=", req.MaxIdle},
+	}
+	for _, kv := range blastDurations {
+		if kv[1] == "" {
+			continue
+		}
+		if !durationRE.MatchString(kv[1]) {
+			return nil, fmt.Errorf("%s expected a duration like 30s", kv[0])
+		}
+		args = append(args, kv[0]+kv[1])
+	}
+	args = append(args,
+		"-conns="+strconv.Itoa(clamp(req.Conns, 1, 64)),
+		"-workers="+strconv.Itoa(clamp(req.Workers, 1, 256)),
+		"-stats-every=5s",
+		"-read-body="+strconv.FormatBool(req.ReadBody),
+	)
+	if req.RPS > 0 {
+		args = append(args, "-rps="+strconv.FormatFloat(req.RPS, 'f', -1, 64))
+	}
+	return args, nil
+}
+
+func resolveRunCommand(runner string, toolArgs []string) (string, []string, error) {
+	if runner == "host" {
+		self, err := os.Executable()
+		if err != nil {
+			return "", nil, err
+		}
+		return self, toolArgs, nil
+	}
+	return "docker", append([]string{"compose", "run", "--rm", "-T", "blast"}, toolArgs...), nil
 }
 
 func safeURL(s string) (string, error) {

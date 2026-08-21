@@ -102,3 +102,30 @@ func TestStackCommandValidatesDurations(t *testing.T) {
 		t.Fatal("stackCommand() succeeded with invalid duration")
 	}
 }
+
+func TestAppendSampleKeepsRecentWindow(t *testing.T) {
+	s := []int64{1, 2, 3}
+	s = appendSample(s, 4, 3)
+	if got, want := s, []int64{2, 3, 4}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("appendSample() = %#v, want %#v", got, want)
+	}
+}
+
+func TestPercentileMs(t *testing.T) {
+	samples := []int64{10, 20, 30, 40, 50}
+	if got := percentileMs(samples, 50); got != 30 {
+		t.Fatalf("percentileMs(50) = %d, want 30", got)
+	}
+	if got := percentileMs(samples, 95); got != 40 {
+		t.Fatalf("percentileMs(95) = %d, want 40", got)
+	}
+}
+
+func TestParsePercent(t *testing.T) {
+	if got := parsePercent("12.5%"); got != 12.5 {
+		t.Fatalf("parsePercent() = %v, want 12.5", got)
+	}
+	if got := parsePercent("bad"); got != 0 {
+		t.Fatalf("parsePercent() = %v, want 0", got)
+	}
+}

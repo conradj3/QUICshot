@@ -82,6 +82,14 @@
   button.tgl.on { border-color:var(--accent); color:var(--accent); background:#12202e; }
   .btns { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
   .hint { font-size:10.5px; color:var(--faint); margin-top:9px; line-height:1.5; }
+  .srOnly { position:absolute !important; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+  .miniTable { display:grid; grid-template-columns:1fr auto; gap:4px 8px; font:11px ui-monospace,monospace; color:var(--dim); }
+  .miniTable b { color:var(--fg); font-weight:600; }
+  .healthRow { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .healthPill { font:10.5px ui-monospace,monospace; padding:3px 8px; border-radius:99px; border:1px solid var(--line); color:var(--dim); }
+  .healthPill.warn { border-color:#6b4a1f; color:var(--warn); background:#241a0d; }
+  .healthPill.bad { border-color:#7a2b2b; color:var(--err); background:#1d1214; }
 
   .toolbar { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 12px;
     background:var(--panel); border-bottom:1px solid var(--line); }
@@ -214,15 +222,15 @@
     <h2>&#9635; Stack</h2>
     <div class="row">
       <div>
-        <label title="How long the edge waits for the origin before returning 524. Cloudflare's real value is 100s; keep it short here so failures happen fast.">origin timeout</label>
+        <label for="originTimeout" title="How long the edge waits for the origin before returning 524. Cloudflare's real value is 100s; keep it short here so failures happen fast.">origin timeout</label>
         <input id="originTimeout" value="10s">
       </div>
       <div>
-        <label title="QUIC max idle timeout the edge applies to CLIENT connections. No packet for this long and the connection dies.">edge max idle</label>
+        <label for="maxIdle" title="QUIC max idle timeout the edge applies to CLIENT connections. No packet for this long and the connection dies.">edge max idle</label>
         <input id="maxIdle" value="30s">
       </div>
       <div>
-        <label title="How often the edge sends QUIC keep-alives to clients. 0 disables them, which is the fastest way to reproduce idle disconnects.">edge keepalive</label>
+        <label for="keepAlive" title="How often the edge sends QUIC keep-alives to clients. 0 disables them, which is the fastest way to reproduce idle disconnects.">edge keepalive</label>
         <input id="keepAlive" value="0s">
       </div>
     </div>
@@ -257,35 +265,65 @@
     <h2>&#9672; Impairment</h2>
     <div class="row">
       <div>
-        <label title="Which container's eth0 to shape. The edge shares eth0 with BOTH hops, so pick connector to impair only the tunnel hop.">target</label>
+        <label for="impSvc" title="Which container's eth0 to shape. The edge shares eth0 with BOTH hops, so pick connector to impair only the tunnel hop.">target</label>
         <select id="impSvc"><option>edge</option><option>connector</option><option>origin</option></select>
       </div>
       <div>
-        <label title="loss = drop a percentage of packets · rate = cap bandwidth · delay = add latency · reorder = deliver out of order">mode</label>
+        <label for="impMode" title="loss = drop a percentage of packets · rate = cap bandwidth · delay = add latency · reorder = deliver out of order">mode</label>
         <select id="impMode"><option>loss</option><option>rate</option><option>delay</option><option>reorder</option></select>
       </div>
     </div>
     <div class="row">
       <div>
-        <label title="loss: 3%   ·   rate: 5mbit   ·   delay: 80ms   ·   reorder: 5%">value</label>
+        <label for="impA" title="loss: 3%   ·   rate: 5mbit   ·   delay: 80ms   ·   reorder: 5%">value</label>
         <input id="impA" value="3%" placeholder="3%">
       </div>
       <div>
-        <label title="delay: jitter such as 30ms. reorder: correlation such as 50%. Leave blank for loss and rate.">jitter / corr</label>
+        <label for="impB" title="delay: jitter such as 30ms. reorder: correlation such as 50%. Leave blank for loss and rate.">jitter / corr</label>
         <input id="impB" placeholder="optional">
+      </div>
+      <div>
+        <label for="impBurst" title="Optional burst/correlation for loss patterns, e.g. 25%">burst</label>
+        <input id="impBurst" placeholder="optional">
       </div>
     </div>
     <div class="btns">
       <button data-impair="apply" title="Attach the netem qdisc to eth0 inside the chosen container">Apply</button>
       <button data-impair="clear" title="Remove all shaping from that container">Clear</button>
     </div>
+    <div class="btns" style="margin-top:6px">
+      <button data-impair-preset="clean" title="Clear impairment on selected service">Clean</button>
+      <button data-impair-preset="cell" title="2% loss with jitter like mobile networks">Cellular</button>
+      <button data-impair-preset="wifi" title="Burst loss + reorder">Wi-Fi congestion</button>
+      <button data-impair-preset="sat" title="High delay + jitter">Satellite</button>
+      <button data-impair-preset="throttle" title="Bandwidth constrained path">Rate cap</button>
+    </div>
     <div class="hint">netem on a multi-queue veth is applied unevenly &mdash; read the kernel counters and the
       latency <em>tail</em>, not the median.</div>
   </div>
 
   <div class="card">
+    <h2>&#9711; Connection lifecycle</h2>
+    <div id="lifecycleMetrics" class="miniTable">Waiting for flow data.</div>
+    <div class="hint">Tracks active QUIC sessions, opens/closes per second, and cumulative drops.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#9881; Protocol visibility</h2>
+    <div id="protocolMetrics" class="miniTable">Waiting for flow data.</div>
+    <div class="hint">Shows negotiated protocol counts, QUIC versions, and 0-RTT acceptance ratio.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#128295; Service health</h2>
+    <div id="serviceHealth" class="miniTable">Waiting for health samples.</div>
+    <div id="serviceHealthBadges" class="healthRow"></div>
+    <div class="hint">CPU/memory are max values across service replicas; buffer errors indicate socket pressure.</div>
+  </div>
+
+  <div class="card">
     <h2>&#9889; Traffic</h2>
-    <label title="Target URL. Use the local edge for scenarios, or any public HTTPS host to test a real tunnel.">target url</label>
+    <label for="url" title="Target URL. Use the local edge for scenarios, or any public HTTPS host to test a real tunnel.">target url</label>
     <input id="url" value="https://edge:8443/fast">
     <div class="btns" style="margin-top:7px">
       <button data-preset="fast"  title="Small fast response. The baseline: proves the tunnel is healthy.">/fast</button>
@@ -295,25 +333,25 @@
       <button data-preset="drip"  title="Streams chunks slowly, exercising mid-body disconnects.">/drip</button>
     </div>
     <div class="row">
-      <div><label title="Number of independent QUIC connections. Each gets its own UDP socket, so kernel drops can be attributed to one connection.">conns</label><input id="conns" type="number" value="4"></div>
-      <div><label title="Concurrent requests per connection. These share one QUIC connection, so this is what exposes stream and flow-control effects.">workers</label><input id="workers" type="number" value="8"></div>
-      <div><label title="Global request rate cap across ALL workers. 0 means as fast as possible. Always set this against production.">rps</label><input id="rps" type="number" value="0"></div>
+      <div><label for="conns" title="Number of independent QUIC connections. Each gets its own UDP socket, so kernel drops can be attributed to one connection.">conns</label><input id="conns" type="number" value="4"></div>
+      <div><label for="workers" title="Concurrent requests per connection. These share one QUIC connection, so this is what exposes stream and flow-control effects.">workers</label><input id="workers" type="number" value="8"></div>
+      <div><label for="rps" title="Global request rate cap across ALL workers. 0 means as fast as possible. Always set this against production.">rps</label><input id="rps" type="number" value="0"></div>
     </div>
     <div class="row">
-      <div><label title="How long the run lasts.">duration</label><input id="duration" value="30s"></div>
-      <div><label title="Per-request timeout. Set it BELOW the edge origin timeout to reproduce 'the client gave up first and no 524 appears anywhere'.">timeout</label><input id="timeout" value="30s"></div>
+      <div><label for="duration" title="How long the run lasts.">duration</label><input id="duration" value="30s"></div>
+      <div><label for="timeout" title="Per-request timeout. Set it BELOW the edge origin timeout to reproduce 'the client gave up first and no 524 appears anywhere'.">timeout</label><input id="timeout" value="30s"></div>
     </div>
     <div class="row">
-      <div><label title="Client-side QUIC keep-alive. 0 lets idle connections die; try 1s to prove keep-alives fix it.">client keepalive</label><input id="cKeepAlive" value="0s"></div>
-      <div><label title="Client-side QUIC max idle timeout. Lower it to force idle-timeout disconnects quickly.">client max idle</label><input id="cMaxIdle" value="30s"></div>
+      <div><label for="cKeepAlive" title="Client-side QUIC keep-alive. 0 lets idle connections die; try 1s to prove keep-alives fix it.">client keepalive</label><input id="cKeepAlive" value="0s"></div>
+      <div><label for="cMaxIdle" title="Client-side QUIC max idle timeout. Lower it to force idle-timeout disconnects quickly.">client max idle</label><input id="cMaxIdle" value="30s"></div>
     </div>
-    <label title="Sent on every request. Use for authenticated endpoints.">header (optional)</label>
+    <label for="header" title="Sent on every request. Use for authenticated endpoints.">header (optional)</label>
     <input id="header" placeholder="Authorization: Bearer ...">
     <div class="row" style="margin-top:9px">
-      <div><label title="docker runs inside the compose network, which is required for the local edge. host runs from this machine, for public hostnames.">runner</label>
+      <div><label for="runner" title="docker runs inside the compose network, which is required for the local edge. host runs from this machine, for public hostnames.">runner</label>
         <select id="runner"><option value="docker">docker</option><option value="host">host</option></select>
       </div>
-      <div><label title="Trust the demo's private CA, or the machine's system trust store. Use system CA for real public endpoints.">trust</label>
+      <div><label for="localCerts" title="Trust the demo's private CA, or the machine's system trust store. Use system CA for real public endpoints.">trust</label>
         <select id="localCerts">
           <option value="true">local CA (demo)</option>
           <option value="false">system CA (public)</option>
@@ -345,30 +383,31 @@
 
 <main>
   <div id="flow" title="Live view of the request path. Links animate while traffic flows and turn red on failures.">
-    <div class="fnode" id="fClient" data-component="client" role="button" aria-label="Show client metrics" tabindex="0" title="Click for client metrics">
+    <button type="button" class="fnode" id="fClient" data-component="client" aria-label="Show client metrics" title="Click for client metrics">
       <div class="fname">client</div><div class="fsub">blast / browser</div>
       <div class="fmetric"><span class="m">req <b id="cReq">0</b></span><span class="m err">fail <b id="cFail">0</b></span></div>
-    </div>
+    </button>
     <div class="flink" id="lk1"><div class="flabel">HTTP/3 &middot; UDP 8443</div><div class="bar"></div><div class="fbadge" id="bd1"></div></div>
-    <div class="fnode" id="fEdge" data-component="edge" role="button" aria-label="Show edge metrics" tabindex="0" title="Click for edge metrics">
+    <button type="button" class="fnode" id="fEdge" data-component="edge" aria-label="Show edge metrics" title="Click for edge metrics">
       <div class="fname">edge</div><div class="fsub">cloudflare stand-in</div>
       <div class="fmetric">
         <span class="m">rps <b id="eRps">0</b></span>
-        <span class="m">avg <b id="eMs">0</b>ms</span>
+        <span class="m">p95 <b id="eP95">0</b>ms</span>
+        <span class="m">p99 <b id="eP99">0</b>ms</span>
         <span class="m err">524 <b id="e524">0</b></span>
         <span class="m err">5xx <b id="e502">0</b></span>
       </div>
-    </div>
+    </button>
     <div class="flink" id="lk2"><div class="flabel">QUIC tunnel &middot; 7844</div><div class="bar"></div><div class="fbadge" id="bd2"></div></div>
-    <div class="fnode" id="fConn" data-component="connector" role="button" aria-label="Show connector metrics" tabindex="0" title="Click for connector metrics">
+    <button type="button" class="fnode" id="fConn" data-component="connector" aria-label="Show connector metrics" title="Click for connector metrics">
       <div class="fname">connector</div><div class="fsub">cloudflared stand-in</div>
       <div class="fmetric"><span class="m" id="tunState">tunnel <b>&mdash;</b></span></div>
-    </div>
+    </button>
     <div class="flink" id="lk3"><div class="flabel">HTTP/1.1 &middot; 8080</div><div class="bar"></div><div class="fbadge" id="bd3"></div></div>
-    <div class="fnode" id="fOrigin" data-component="origin" role="button" aria-label="Show origin metrics" tabindex="0" title="Click for origin metrics">
+    <button type="button" class="fnode" id="fOrigin" data-component="origin" aria-label="Show origin metrics" title="Click for origin metrics">
       <div class="fname">origin</div><div class="fsub">your app</div>
       <div class="fmetric"><span class="m">reached <b id="oRps">0</b>/s</span></div>
-    </div>
+    </button>
   </div>
   <div class="toolbar">
     <span class="chip on" data-f="edge" title="Show or hide edge container logs">edge</span>
@@ -377,6 +416,7 @@
     <span class="chip on" data-f="run" title="Show or hide blast/probe output">run</span>
     <span class="chip on" data-f="ui" title="Show or hide commands this panel ran">ui</span>
     <span class="chip on" id="prettyChip" title="Format the containers' JSON logs into level, message and key=value fields. Turn off for raw JSON.">pretty</span>
+    <label for="grep" class="srOnly">filter logs</label>
     <input type="search" id="grep" placeholder="filter..." title="Only show lines containing this text">
     <label class="lbl" title="Keep scrolling to the newest line"><input type="checkbox" id="follow" checked> follow</label>
     <span class="spacer"></span>
@@ -404,6 +444,7 @@
 
     <h3>Reading the log</h3>
     <table>
+      <tr><th scope="col" class="srOnly">component</th><th scope="col" class="srOnly">meaning</th></tr>
       <tr><td>edge</td><td>The Cloudflare stand-in. Decides 524 / 1033 and logs every proxied request.</td></tr>
       <tr><td>connector</td><td>The <code>cloudflared</code> stand-in. Dials <em>outbound</em> to the edge.</td></tr>
       <tr><td>origin</td><td>Your app. Its latency is driven entirely by the URL path.</td></tr>
@@ -413,6 +454,7 @@
 
     <h3>What to look for</h3>
     <table>
+      <tr><th scope="col" class="srOnly">signal</th><th scope="col" class="srOnly">interpretation</th></tr>
       <tr><td>524</td><td>The edge reached the origin but got no response in time.
         <code>elapsed_ms</code> matches the <em>edge</em> timeout, not the origin's delay.</td></tr>
       <tr><td>1033</td><td>No connector registered. The tunnel is down, not the origin.</td></tr>
@@ -430,6 +472,7 @@
     <p>Who reports a failure depends on the ordering of the client timeout, the edge origin timeout,
       and the origin's own latency.</p>
     <table>
+      <tr><th scope="col" class="srOnly">condition</th><th scope="col" class="srOnly">result</th></tr>
       <tr><td>client &gt; edge</td><td>Clean 524. The classic case.</td></tr>
       <tr><td>client &lt; edge</td><td>Client sees <code>client_deadline</code>, the edge logs nothing.
         Very confusing in production.</td></tr>
@@ -466,7 +509,7 @@ const srcKey = s => (s === 'blast' || s === 'probe') ? 'run' : s;
 function classify(line) {
   if (/"level":"ERROR"|\[ FAIL \]|error code:|exceeds -max|VERDICT: (?!HTTP\/3 works)/.test(line)) return 'err';
   if (/"level":"WARN"|\[ warn \]/.test(line)) return 'warn';
-  if (/\[  ok  \]|VERDICT: HTTP\/3 works|conn drops      0/.test(line)) return 'good';
+  if (/\[\s{2}ok\s{2}\]|VERDICT: HTTP\/3 works|conn drops\s{6}0/.test(line)) return 'good';
   return '';
 }
 const HOT_KEYS = new Set(['status','cf_code','elapsed_ms','err_kind','close_kind','ray','path','proto']);
@@ -549,7 +592,7 @@ function flush() {
   queue.length = 0;
   if (!primed) { logEl.replaceChildren(); primed = true; }
   logEl.appendChild(frag);
-  while (logEl.childElementCount > MAX_NODES) logEl.removeChild(logEl.firstElementChild);
+  while (logEl.childElementCount > MAX_NODES) logEl.firstElementChild.remove();
   if (follow.checked && wasBottom) toBottom();
   else if (!wasBottom) badge.classList.add('show');
 }
@@ -601,6 +644,9 @@ es.onmessage = ev => {
     latestFlow = m;
     renderFlow(m);
     renderComponentMetrics();
+    renderLifecycle();
+    renderProtocol();
+    renderServiceHealth();
   } else if (m.t === 'udp') {
     latestUDP = m;
     $('#stats').innerHTML =
@@ -647,40 +693,95 @@ function renderFlow(m) {
   const now = Date.now();
   if (m.edge.rps > 0) lastBusy = now;
   if (m.edge.s524 + m.edge.s502 > 0) lastFail = now;
-  const busy = now - lastBusy < HOLD_MS, failing = now - lastFail < HOLD_MS;
+  const busy = now - lastBusy < HOLD_MS;
+  const failing = now - lastFail < HOLD_MS;
 
+  writeFlowNumbers(m);
+  const tunnelDown = m.tunnel.known && !m.tunnel.up;
+  applyNodeClass('#fClient', clientNodeState(m.client.fail > 0, busy));
+  applyNodeClass('#fEdge', edgeNodeState(failing, busy));
+  applyNodeClass('#fConn', connectorNodeState(tunnelDown, busy));
+  applyNodeClass('#fOrigin', m.origin.rps > 0 ? 'hot' : '');
+  markSelectedComponent();
+
+  renderLinkStates(m, busy, failing, tunnelDown);
+}
+
+function writeFlowNumbers(m) {
   $('#cReq').textContent  = m.client.req;
   $('#cFail').textContent = m.client.fail;
   $('#eRps').textContent  = m.edge.rps;
-  $('#eMs').textContent   = m.edge.avgMs;
+  $('#eP95').textContent  = m.edge.p95Ms;
+  $('#eP99').textContent  = m.edge.p99Ms;
   $('#e524').textContent  = m.edge.t524;
   $('#e502').textContent  = m.edge.t502;
   $('#oRps').textContent  = m.origin.rps;
+  setTunnelStateLabel(m.tunnel);
+}
 
+function setTunnelStateLabel(tunnel) {
   const tun = $('#tunState');
-  if (!m.tunnel.known) {
+  if (!tunnel.known) {
     tun.innerHTML = 'tunnel <b style="color:var(--faint)">unknown</b>';
-  } else if (m.tunnel.up) {
-    tun.innerHTML = 'tunnel <b style="color:var(--ok)">up</b>' +
-                    (m.tunnel.n > 0 ? ' &times;' + m.tunnel.n : '');
-  } else {
-    tun.innerHTML = 'tunnel <b style="color:var(--err)">down</b>';
+    return;
   }
+  if (tunnel.up) {
+    const replicas = tunnel.n > 0 ? ' &times;' + tunnel.n : '';
+    tun.innerHTML = 'tunnel <b style="color:var(--ok)">up</b>' + replicas;
+    return;
+  }
+  tun.innerHTML = 'tunnel <b style="color:var(--err)">down</b>';
+}
 
-  const tunnelDown = m.tunnel.known && !m.tunnel.up;
-  $('#fClient').className  = 'fnode' + (m.client.fail > 0 ? ' bad' : busy ? ' hot' : '');
-  $('#fEdge').className    = 'fnode' + (failing ? ' bad' : busy ? ' hot' : '');
-  $('#fConn').className    = 'fnode' + (tunnelDown ? ' down' : busy ? ' hot' : '');
-  $('#fOrigin').className  = 'fnode' + (m.origin.rps > 0 ? ' hot' : '');
-  markSelectedComponent();
+function applyNodeClass(selector, state) {
+  $(selector).className = 'fnode' + (state ? ' ' + state : '');
+}
 
-  // The impairment badge is drawn on the hop it actually affects.
+function clientNodeState(hasFail, busy) {
+  if (hasFail) return 'bad';
+  if (busy) return 'hot';
+  return '';
+}
+
+function edgeNodeState(failing, busy) {
+  if (failing) return 'bad';
+  if (busy) return 'hot';
+  return '';
+}
+
+function connectorNodeState(tunnelDown, busy) {
+  if (tunnelDown) return 'down';
+  if (busy) return 'hot';
+  return '';
+}
+
+function renderLinkStates(m, busy, failing, tunnelDown) {
   const imp = m.impair || '';
-  const on = w => imp.startsWith(w) ? imp : '';
-  setLink($('#lk1'), busy ? (failing ? 'err' : 'active') : '', on('blast') || on('edge'));
-  setLink($('#lk2'), tunnelDown ? 'dead' : busy ? (failing ? 'err' : 'active') : '',
-          on('connector') || on('edge'));
-  setLink($('#lk3'), m.origin.rps > 0 || (busy && !tunnelDown) ? (failing ? 'err' : 'active') : '', on('origin'));
+  const edgeImp = badgeForHop(imp, ['blast', 'edge']);
+  const tunnelImp = badgeForHop(imp, ['connector', 'edge']);
+  const originImp = badgeForHop(imp, ['origin']);
+  const activeState = failing ? 'err' : 'active';
+
+  setLink($('#lk1'), busy ? activeState : '', edgeImp);
+
+  const lk2State = linkTwoState(tunnelDown, busy, activeState);
+  setLink($('#lk2'), lk2State, tunnelImp);
+
+  const originActive = m.origin.rps > 0 || (busy && !tunnelDown);
+  setLink($('#lk3'), originActive ? activeState : '', originImp);
+}
+
+function linkTwoState(tunnelDown, busy, activeState) {
+  if (tunnelDown) return 'dead';
+  if (busy) return activeState;
+  return '';
+}
+
+function badgeForHop(impair, prefixes) {
+  for (const prefix of prefixes) {
+    if (impair.startsWith(prefix)) return impair;
+  }
+  return '';
 }
 
 function metricRow(label, value) {
@@ -693,9 +794,18 @@ function markSelectedComponent() {
 }
 
 function connectorDistribution(connectorReq) {
-  const entries = Object.entries(connectorReq || {}).sort((a, b) => Number(a[0]) - Number(b[0]));
+  const req = connectorReq || {};
+  const p95 = (latestFlow?.tunnel?.connectorP95) || {};
+  const p99 = (latestFlow?.tunnel?.connectorP99) || {};
+  const err = (latestFlow?.tunnel?.connectorErr) || {};
+  const entries = Object.entries(req).sort((a, b) => Number(a[0]) - Number(b[0]));
   if (!entries.length) return 'no requests yet';
-  return entries.map(([id, n]) => '#' + id + ':' + n).join('  ');
+  return entries.map(([id, n]) => {
+    const e = err[id] || 0;
+    const l95 = p95[id] || 0;
+    const l99 = p99[id] || 0;
+    return '#' + id + ': req=' + n + ' err=' + e + ' p95=' + l95 + 'ms p99=' + l99 + 'ms';
+  }).join('  ');
 }
 
 function renderComponentMetrics() {
@@ -719,13 +829,15 @@ function renderComponentMetrics() {
       ['5xx total', f.edge.t502],
       ['current rps', f.edge.rps],
       ['avg latency ms', f.edge.avgMs],
+      ['p50 / p95 / p99', f.edge.p50Ms + ' / ' + f.edge.p95Ms + ' / ' + f.edge.p99Ms],
       ['udp in/out', udp.in + ' / ' + udp.out],
       ['rcvbuf/sndbuf err', udp.rcvbuf + ' / ' + udp.sndbuf],
     ],
     connector: [
       ['registered replicas', f.tunnel.n],
-      ['tunnel state', f.tunnel.known ? (f.tunnel.up ? 'up' : 'down') : 'unknown'],
+      ['tunnel state', tunnelStateText(f.tunnel)],
       ['request spread', connectorDistribution(f.tunnel.connectorReq)],
+      ['open/close per sec', f.lifecycle.openSec + ' / ' + f.lifecycle.closedSec],
       ['impairment', f.impair || 'none'],
     ],
     origin: [
@@ -736,6 +848,90 @@ function renderComponentMetrics() {
   };
   box.innerHTML = (rowsByComponent[selectedComponent] || []).map(([k, v]) => metricRow(k, v)).join('');
   markSelectedComponent();
+}
+
+function tunnelStateText(tunnel) {
+  if (!tunnel.known) return 'unknown';
+  return tunnel.up ? 'up' : 'down';
+}
+
+function renderLifecycle() {
+  const box = $('#lifecycleMetrics');
+  if (!latestFlow) {
+    box.textContent = 'Waiting for flow data.';
+    return;
+  }
+  const l = latestFlow.lifecycle || {};
+  box.innerHTML = [
+    metricRow('active sessions', l.active || 0),
+    metricRow('opens/sec', l.openSec || 0),
+    metricRow('closes/sec', l.closedSec || 0),
+    metricRow('opens total', l.openTotal || 0),
+    metricRow('closes total', l.closedTotal || 0),
+    metricRow('drops total', l.dropsTotal || 0),
+  ].join('');
+}
+
+function renderProtocol() {
+  const box = $('#protocolMetrics');
+  if (!latestFlow) {
+    box.textContent = 'Waiting for flow data.';
+    return;
+  }
+  const p = latestFlow.protocol || {};
+  const negotiated = p.negotiated || {};
+  const versions = p.versions || {};
+  const negotiatedText = Object.entries(negotiated).map(([k, v]) => k + '=' + v).join('  ') || 'none';
+  const versionText = Object.entries(versions).map(([k, v]) => k + '=' + v).join('  ') || 'none';
+  const accept = p.zeroRTTAccept || 0;
+  const reject = p.zeroRTTReject || 0;
+  const total = accept + reject;
+  const ratio = total > 0 ? Math.round((accept / total) * 100) + '%' : 'n/a';
+  box.innerHTML = [
+    metricRow('negotiated protocols', negotiatedText),
+    metricRow('quic versions', versionText),
+    metricRow('0-rtt accepted', accept),
+    metricRow('0-rtt rejected', reject),
+    metricRow('0-rtt accept ratio', ratio),
+  ].join('');
+}
+
+function serviceHealthSeverity(cpu, mem, udpBad) {
+  if (udpBad || cpu >= 90 || mem >= 90) return 'bad';
+  if (cpu >= 70 || mem >= 75) return 'warn';
+  return '';
+}
+
+function renderServiceHealth() {
+  const box = $('#serviceHealth');
+  const badges = $('#serviceHealthBadges');
+  if (!latestFlow) {
+    box.textContent = 'Waiting for health samples.';
+    badges.innerHTML = '';
+    return;
+  }
+  const health = latestFlow.health || {};
+  const udp = latestUDP || {rcvbuf:0, sndbuf:0};
+  const rows = [];
+  const pills = [];
+  ['edge', 'connector', 'origin'].forEach(name => {
+    const h = health[name] || {cpu:0, mem:0, replicas:0};
+    rows.push(metricRow(name + ' cpu/mem', h.cpu.toFixed(1) + '% / ' + h.mem.toFixed(1) + '% (x' + h.replicas + ')'));
+    const sev = serviceHealthSeverity(h.cpu, h.mem, name === 'edge' && (udp.rcvbuf > 0 || udp.sndbuf > 0));
+    const label = name + ' ' + serviceHealthLabel(sev);
+    pills.push('<span class="healthPill ' + sev + '">' + label + '</span>');
+  });
+  if (udp.rcvbuf > 0 || udp.sndbuf > 0) {
+    pills.push('<span class="healthPill bad">udp buffer pressure rcv=' + udp.rcvbuf + ' snd=' + udp.sndbuf + '</span>');
+  }
+  box.innerHTML = rows.join('');
+  badges.innerHTML = pills.join('');
+}
+
+function serviceHealthLabel(sev) {
+  if (sev === 'bad') return 'saturated';
+  if (sev === 'warn') return 'warm';
+  return 'healthy';
 }
 
 document.querySelectorAll('[data-component]').forEach(n => {
@@ -777,6 +973,10 @@ async function beginNewTest(promptText) {
   latestFlow = null;
   latestUDP = null;
   $('#componentMetrics').textContent = 'Waiting for flow data.';
+  $('#lifecycleMetrics').textContent = 'Waiting for flow data.';
+  $('#protocolMetrics').textContent = 'Waiting for flow data.';
+  $('#serviceHealth').textContent = 'Waiting for health samples.';
+  $('#serviceHealthBadges').innerHTML = '';
   await post('/api/reset');
   return true;
 }
@@ -794,7 +994,36 @@ document.querySelectorAll('[data-impair]').forEach(b => b.onclick = () => {
   post('/api/impair', {
     service: $('#impSvc').value,
     mode: b.dataset.impair === 'clear' ? 'clear' : $('#impMode').value,
-    a: $('#impA').value, b: $('#impB').value,
+    a: $('#impA').value, b: $('#impB').value, burst: $('#impBurst').value,
+  });
+});
+
+const impairmentPresets = {
+  clean:    {mode: 'clear', a: '', b: '', burst: ''},
+  cell:     {mode: 'loss', a: '2%', b: '', burst: '25%'},
+  wifi:     {mode: 'reorder', a: '5%', b: '50%', burst: ''},
+  sat:      {mode: 'delay', a: '350ms', b: '60ms', burst: ''},
+  throttle: {mode: 'rate', a: '3mbit', b: '', burst: ''},
+};
+
+document.querySelectorAll('[data-impair-preset]').forEach(b => b.onclick = async () => {
+  if (!ensureIdle('impairment preset')) return;
+  const p = impairmentPresets[b.dataset.impairPreset];
+  if (!p) return;
+  if (p.mode === 'clear') {
+    await post('/api/impair', {service: $('#impSvc').value, mode: 'clear'});
+    return;
+  }
+  $('#impMode').value = p.mode;
+  $('#impA').value = p.a;
+  $('#impB').value = p.b;
+  $('#impBurst').value = p.burst;
+  await post('/api/impair', {
+    service: $('#impSvc').value,
+    mode: p.mode,
+    a: p.a,
+    b: p.b,
+    burst: p.burst,
   });
 });
 $('#stop').onclick = () => post('/api/stop');
