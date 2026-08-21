@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
@@ -32,16 +33,19 @@ import (
 )
 
 type config struct {
-	publicAddr    string
-	tunnelAddr    string
-	certDir       string
-	originTimeout time.Duration
-	maxIdle       time.Duration
-	keepAlive     time.Duration
-	recvBuf       int
-	sendBuf       int
-	statsEvery    time.Duration
-	qlogDir       string
+	publicAddr      string
+	tunnelAddr      string
+	certDir         string
+	originTimeout   time.Duration
+	maxIdle         time.Duration
+	keepAlive       time.Duration
+	tunnelMaxIdle   time.Duration
+	tunnelKeepAlive time.Duration
+	tunnelLB        string
+	recvBuf         int
+	sendBuf         int
+	statsEvery      time.Duration
+	qlogDir         string
 }
 
 type Edge struct {
@@ -68,12 +72,18 @@ func Main(args []string) error {
 	fs.DurationVar(&cfg.originTimeout, "origin-timeout", 10*time.Second, "no response from origin within this window yields a 524")
 	fs.DurationVar(&cfg.maxIdle, "max-idle-timeout", 30*time.Second, "QUIC max idle timeout for client connections")
 	fs.DurationVar(&cfg.keepAlive, "keepalive", 0, "QUIC keep-alive period for client connections (0 disables)")
+	fs.DurationVar(&cfg.tunnelMaxIdle, "tunnel-max-idle-timeout", 30*time.Second, "QUIC max idle timeout for connector connections")
+	fs.DurationVar(&cfg.tunnelKeepAlive, "tunnel-keepalive", 5*time.Second, "QUIC keep-alive period for connector connections (0 disables)")
+	fs.StringVar(&cfg.tunnelLB, "tunnel-lb", "rr", "how the edge picks a connector: rr (round-robin) or hash (by request path)")
 	fs.IntVar(&cfg.recvBuf, "udp-recv-buffer", 0, "SO_RCVBUF for the public UDP socket, 0 = leave to quic-go")
 	fs.IntVar(&cfg.sendBuf, "udp-send-buffer", 0, "SO_SNDBUF for the public UDP socket, 0 = leave to quic-go")
 	fs.DurationVar(&cfg.statsEvery, "stats-every", 10*time.Second, "how often to log kernel UDP counters")
 	fs.StringVar(&cfg.qlogDir, "qlog-dir", "", "write QUIC qlog traces to this directory (empty disables)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if cfg.tunnelLB != "rr" && cfg.tunnelLB != "hash" {
+		return fmt.Errorf("-tunnel-lb must be rr or hash")
 	}
 
 	e := &Edge{cfg: cfg, log: slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("role", "edge")}
@@ -102,11 +112,11 @@ func (e *Edge) serveTunnel(ctx context.Context, cert tls.Certificate) error {
 		NextProtos:   []string{certs.TunnelALPN},
 		MinVersion:   tls.VersionTLS13,
 	}
-	// The tunnel hop deliberately uses a short idle timeout with keep-alives, the
-	// same shape as cloudflared's edge connection.
+	// The tunnel hop uses its own idle/keepalive knobs, independent of the
+	// public HTTP/3 hop. Defaults match cloudflared's edge connection shape.
 	quicConf := &quic.Config{
-		MaxIdleTimeout:     30 * time.Second,
-		KeepAlivePeriod:    5 * time.Second,
+		MaxIdleTimeout:     e.cfg.tunnelMaxIdle,
+		KeepAlivePeriod:    e.cfg.tunnelKeepAlive,
 		MaxIncomingStreams: 1 << 14,
 	}
 	if err := qlogtrace.Configure(quicConf, e.cfg.qlogDir); err != nil {
@@ -116,7 +126,10 @@ func (e *Edge) serveTunnel(ctx context.Context, cert tls.Certificate) error {
 	if err != nil {
 		return fmt.Errorf("listen for connectors: %w", err)
 	}
-	e.log.Info("tunnel listener up", "addr", e.cfg.tunnelAddr, "alpn", certs.TunnelALPN)
+	e.log.Info("tunnel listener up", "addr", e.cfg.tunnelAddr, "alpn", certs.TunnelALPN,
+		"max_idle_timeout", e.cfg.tunnelMaxIdle.String(),
+		"keepalive", e.cfg.tunnelKeepAlive.String(),
+		"lb", e.cfg.tunnelLB)
 
 	go func() {
 		for {
@@ -159,14 +172,27 @@ func (e *Edge) addConnector(conn *quic.Conn) {
 	}()
 }
 
-func (e *Edge) pickConnector() (connectorRef, bool) {
+func (e *Edge) pickConnector(key string) (connectorRef, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if len(e.connectors) == 0 {
+	n := len(e.connectors)
+	if n == 0 {
 		return connectorRef{}, false
 	}
-	i := (e.rr.Add(1) - 1) % uint64(len(e.connectors))
+	i := pickConnectorIndex(n, key, e.cfg.tunnelLB, &e.rr)
 	return e.connectors[i], true
+}
+
+func pickConnectorIndex(n int, key, mode string, rr *atomic.Uint64) int {
+	if n <= 0 {
+		return 0
+	}
+	if mode == "hash" && key != "" {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(key))
+		return int(h.Sum32() % uint32(n))
+	}
+	return int((rr.Add(1) - 1) % uint64(n))
 }
 
 // ---------------------------------------------------------------- public side
@@ -238,7 +264,7 @@ func (e *Edge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log := e.log.With("ray", ray, "path", r.URL.Path, "proto", r.Proto)
 
-	connector, ok := e.pickConnector()
+	connector, ok := e.pickConnector(r.URL.Path)
 	if !ok {
 		// Cloudflare's "error code: 1033 — tunnel not found / no connector".
 		writeCFError(w, http.StatusBadGateway, 1033, "no connector registered")
