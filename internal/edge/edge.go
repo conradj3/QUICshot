@@ -373,7 +373,9 @@ func writeCFError(w http.ResponseWriter, status, cfCode int, detail string) {
 
 func newRay() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
 	return hex.EncodeToString(b)
 }
 

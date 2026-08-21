@@ -51,12 +51,33 @@ func Generate(dir string, hosts []string, force bool) error {
 			return nil
 		}
 	}
-
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ca, err := mintCA()
 	if err != nil {
 		return err
 	}
-	caTmpl := &x509.Certificate{
+	leafDER, leafKeyDER, err := mintLeaf(ca, hosts)
+	if err != nil {
+		return err
+	}
+	if err := writeMaterial(dir, ca.der, leafDER, leafKeyDER); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "certs: wrote %s/{%s,%s,%s}\n", dir, CAFile, CertFile, KeyFile)
+	return nil
+}
+
+type caMaterial struct {
+	key  *ecdsa.PrivateKey
+	cert *x509.Certificate
+	der  []byte
+}
+
+func mintCA() (caMaterial, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return caMaterial{}, err
+	}
+	tmpl := &x509.Certificate{
 		SerialNumber:          serial(),
 		Subject:               pkix.Name{CommonName: "QUICshot local CA"},
 		NotBefore:             time.Now().Add(-time.Hour),
@@ -65,20 +86,23 @@ func Generate(dir string, hosts []string, force bool) error {
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
-		return err
+		return caMaterial{}, err
 	}
-	caCert, err := x509.ParseCertificate(caDER)
+	cert, err := x509.ParseCertificate(der)
 	if err != nil {
-		return err
+		return caMaterial{}, err
 	}
+	return caMaterial{key: key, cert: cert, der: der}, nil
+}
 
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+func mintLeaf(ca caMaterial, hosts []string) (leafDER, keyDER []byte, err error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	leafTmpl := &x509.Certificate{
+	tmpl := &x509.Certificate{
 		SerialNumber: serial(),
 		Subject:      pkix.Name{CommonName: "QUICshot edge"},
 		NotBefore:    time.Now().Add(-time.Hour),
@@ -86,39 +110,41 @@ func Generate(dir string, hosts []string, force bool) error {
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
+	addHosts(tmpl, hosts)
+	leafDER, err = x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyDER, err = x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	return leafDER, keyDER, nil
+}
+
+func addHosts(tmpl *x509.Certificate, hosts []string) {
 	for _, h := range hosts {
 		h = strings.TrimSpace(h)
 		if h == "" {
 			continue
 		}
 		if ip := net.ParseIP(h); ip != nil {
-			leafTmpl.IPAddresses = append(leafTmpl.IPAddresses, ip)
-		} else {
-			leafTmpl.DNSNames = append(leafTmpl.DNSNames, h)
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+			continue
 		}
+		tmpl.DNSNames = append(tmpl.DNSNames, h)
 	}
-	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		return err
-	}
-	leafKeyDER, err := x509.MarshalECPrivateKey(leafKey)
-	if err != nil {
-		return err
-	}
+}
 
+func writeMaterial(dir string, caDER, leafDER, leafKeyDER []byte) error {
 	if err := writePEM(filepath.Join(dir, CAFile), "CERTIFICATE", caDER, 0o644); err != nil {
 		return err
 	}
-	// The leaf is written with its issuing CA appended so a single file is a full chain.
 	chain := append(pemBytes("CERTIFICATE", leafDER), pemBytes("CERTIFICATE", caDER)...)
 	if err := os.WriteFile(filepath.Join(dir, CertFile), chain, 0o644); err != nil {
 		return err
 	}
-	if err := writePEM(filepath.Join(dir, KeyFile), "EC PRIVATE KEY", leafKeyDER, 0o600); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "certs: wrote %s/{%s,%s,%s}\n", dir, CAFile, CertFile, KeyFile)
-	return nil
+	return writePEM(filepath.Join(dir, KeyFile), "EC PRIVATE KEY", leafKeyDER, 0o600)
 }
 
 // LoadCAPool reads the generated CA so clients can verify the edge.

@@ -39,44 +39,47 @@ func Classify(err error) (Kind, string) {
 	if err == nil {
 		return KindNone, ""
 	}
+	if kind, detail, ok := classifyQUIC(err); ok {
+		return kind, detail
+	}
+	return classifyFallback(err)
+}
 
+func classifyQUIC(err error) (Kind, string, bool) {
 	var h3 *http3.Error
 	if errors.As(err, &h3) {
-		return KindHTTP3, fmt.Sprintf("code=%s remote=%t msg=%q", h3.ErrorCode.String(), h3.Remote, h3.ErrorMessage)
+		return KindHTTP3, fmt.Sprintf("code=%s remote=%t msg=%q", h3.ErrorCode.String(), h3.Remote, h3.ErrorMessage), true
 	}
-
 	var appErr *quic.ApplicationError
 	if errors.As(err, &appErr) {
-		return KindApplicationErr, fmt.Sprintf("code=0x%x remote=%t reason=%q", uint64(appErr.ErrorCode), appErr.Remote, appErr.ErrorMessage)
+		return KindApplicationErr, fmt.Sprintf("code=0x%x remote=%t reason=%q", uint64(appErr.ErrorCode), appErr.Remote, appErr.ErrorMessage), true
 	}
-
 	var transErr *quic.TransportError
 	if errors.As(err, &transErr) {
-		return KindTransportError, fmt.Sprintf("code=%s remote=%t reason=%q", transErr.ErrorCode.String(), transErr.Remote, transErr.ErrorMessage)
+		return KindTransportError, fmt.Sprintf("code=%s remote=%t reason=%q", transErr.ErrorCode.String(), transErr.Remote, transErr.ErrorMessage), true
 	}
-
 	var streamErr *quic.StreamError
 	if errors.As(err, &streamErr) {
-		return KindStreamReset, fmt.Sprintf("stream=%d code=0x%x remote=%t", int64(streamErr.StreamID), uint64(streamErr.ErrorCode), streamErr.Remote)
+		return KindStreamReset, fmt.Sprintf("stream=%d code=0x%x remote=%t", int64(streamErr.StreamID), uint64(streamErr.ErrorCode), streamErr.Remote), true
 	}
-
 	var idle *quic.IdleTimeoutError
 	if errors.As(err, &idle) {
-		return KindIdleTimeout, "no recent network activity within max_idle_timeout"
+		return KindIdleTimeout, "no recent network activity within max_idle_timeout", true
 	}
-
 	var hs *quic.HandshakeTimeoutError
 	if errors.As(err, &hs) {
-		return KindHandshake, "handshake did not complete in time"
+		return KindHandshake, "handshake did not complete in time", true
 	}
+	return "", "", false
+}
 
+func classifyFallback(err error) (Kind, string) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return KindDeadline, err.Error()
 	}
 	if errors.Is(err, context.Canceled) {
 		return KindCanceled, err.Error()
 	}
-
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "stateless reset"):
@@ -88,7 +91,6 @@ func Classify(err error) (Kind, string) {
 	case strings.Contains(msg, "no buffer space") || strings.Contains(msg, "buffer size"):
 		return KindBufferPressure, msg
 	}
-
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return KindNetworkTimeout, msg

@@ -65,10 +65,10 @@ type earlyDial struct {
 
 func (d earlyDial) close() {
 	if d.conn != nil {
-		d.conn.CloseWithError(0, "0rtt probe")
+		_ = d.conn.CloseWithError(0, "0rtt probe")
 	}
 	if d.tr != nil {
-		d.tr.Close()
+		_ = d.tr.Close()
 	}
 }
 
@@ -82,17 +82,17 @@ func dialEarlyOnce(ctx context.Context, cfg config, tlsConf *tls.Config, quicCon
 	defer cancel()
 	conn, err := tr.DialEarly(dctx, addr, tlsConf, quicConf)
 	if err != nil {
-		tr.Close()
-		udp.Close()
+		_ = tr.Close()
+		_ = udp.Close()
 		return earlyDial{}, err
 	}
 	select {
 	case <-conn.HandshakeComplete():
 	case <-conn.Context().Done():
-		tr.Close()
+		_ = tr.Close()
 		return earlyDial{}, fmt.Errorf("handshake aborted: %w", context.Cause(conn.Context()))
 	case <-dctx.Done():
-		tr.Close()
+		_ = tr.Close()
 		return earlyDial{}, dctx.Err()
 	}
 	state := conn.ConnectionState()

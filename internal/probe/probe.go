@@ -143,7 +143,7 @@ func probeTCP(target, host, port string, timeout time.Duration, insecure bool, h
 		issuer = c.Issuer.CommonName
 		expiry = c.NotAfter.Format("2006-01-02")
 	}
-	conn.Close()
+	_ = conn.Close()
 	step("TCP + TLS", result{true, fmt.Sprintf("alpn=%s issuer=%q expires=%s",
 		state.NegotiatedProtocol, issuer, expiry)})
 
@@ -164,7 +164,7 @@ func probeTCP(target, host, port string, timeout time.Duration, insecure bool, h
 		return "", false
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
 	altSvc = resp.Header.Get("Alt-Svc")
 	fronting := "origin"
@@ -212,7 +212,7 @@ func probeH3(target string, timeout time.Duration, insecure bool, qlogDir string
 		return false, fmt.Sprintf("%s: %s (after %s)", kind, detail, time.Since(start).Round(time.Millisecond))
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return true, fmt.Sprintf("%s %s in %s", resp.Proto, resp.Status, time.Since(start).Round(time.Millisecond))
 }
 

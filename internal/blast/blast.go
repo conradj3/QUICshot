@@ -520,7 +520,7 @@ func doRequest(ctx context.Context, rec *recorder, client *http.Client, spec *re
 
 	rec.recordProto(resp.Proto)
 	n, cfCode, err := drainResponse(resp, spec.readBody)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	elapsed := time.Since(start)
 
 	recordHTTPResult(ctx, rec, httpResult{
@@ -574,12 +574,19 @@ func drainResponse(resp *http.Response, readBody bool) (n int64, cfCode int, err
 
 func drainErrorBody(resp *http.Response) (int64, int, error) {
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	io.Copy(io.Discard, resp.Body)
-	cfCode := 0
-	if m := cfErrorRE.FindSubmatch(snippet); m != nil {
-		cfCode, _ = strconv.Atoi(string(m[1]))
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return int64(len(snippet)), parseCFCode(snippet), err
 	}
-	return int64(len(snippet)), cfCode, nil
+	return int64(len(snippet)), parseCFCode(snippet), nil
+}
+
+func parseCFCode(snippet []byte) int {
+	m := cfErrorRE.FindSubmatch(snippet)
+	if m == nil {
+		return 0
+	}
+	code, _ := strconv.Atoi(string(m[1]))
+	return code
 }
 
 func recordDialError(ctx context.Context, rec *recorder, err error, connIdx, workerIdx int, url string, start time.Time) {
