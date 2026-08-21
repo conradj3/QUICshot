@@ -126,11 +126,11 @@ func runOnce(ctx context.Context, log *slog.Logger, cfg runConfig) error {
 		if err != nil {
 			return err
 		}
-		go serveStream(ctx, log, str, cfg.originURL, cfg.origin)
+		go serveStream(log, str, cfg.originURL, cfg.origin)
 	}
 }
 
-func serveStream(ctx context.Context, log *slog.Logger, str *quic.Stream, originURL string, client *http.Client) {
+func serveStream(log *slog.Logger, str *quic.Stream, originURL string, client *http.Client) {
 	defer str.Close()
 
 	req, err := http.ReadRequest(bufio.NewReader(str))
