@@ -20,6 +20,8 @@ import (
 // on startup. A deliberately small buffer therefore only sticks if the host's
 // net.core.rmem_max is also low — see scripts/host-rmem.sh.
 func Listen(addr string, recvBuf, sendBuf int) (*net.UDPConn, error) {
+	// "udp" + an unspecified address (":port") is dual-stack on Linux. Callers
+	// that pass "0.0.0.0:port" stay IPv4-only on purpose.
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
