@@ -84,4 +84,73 @@ $COMPOSE run --rm -T blast blast \
 grep -q '"status":502' logs/smoke-1033.jsonl || fail "connector-down path did not produce status 502"
 grep -q 'cf_error_code=1033' logs/smoke-1033.jsonl || fail "connector-down path did not record cf_error_code=1033"
 
+log "restoring connector and edge timeouts"
+$COMPOSE start connector >/dev/null
+EDGE_ORIGIN_TIMEOUT=10s $COMPOSE up -d --force-recreate edge connector
+wait_fast_path >/dev/null || fail "fast path did not recover after connector restore"
+
+log "checking origin RST classification (1014)"
+$COMPOSE run --rm -T blast blast \
+  -url=https://edge:8443/reset \
+  -certs=/certs -server-name=edge \
+  -conns=1 -workers=1 -requests=1 -duration=10s -timeout=5s \
+  -log=/logs/smoke-1014.jsonl >/tmp/quicshot-smoke-1014.out 2>&1 || true
+grep -q '"status":502' logs/smoke-1014.jsonl || fail "origin RST did not produce status 502"
+grep -q 'cf_error_code=1014' logs/smoke-1014.jsonl || fail "origin RST did not record cf_error_code=1014"
+
+log "checking invisible client-deadline (no 524)"
+rm -f logs/smoke-invisible.jsonl
+$COMPOSE run --rm -T blast blast \
+  -url='https://edge:8443/slow?ms=5000' \
+  -certs=/certs -server-name=edge \
+  -conns=1 -workers=1 -requests=1 -duration=8s -timeout=1s \
+  -log=/logs/smoke-invisible.jsonl >/tmp/quicshot-smoke-invisible.out 2>&1 || true
+grep -q 'client_deadline' logs/smoke-invisible.jsonl || fail "short client timeout did not record client_deadline"
+if grep -q '"status":524' logs/smoke-invisible.jsonl; then
+  fail "invisible-failure path logged a 524; the client should have given up first"
+fi
+
+log "checking idle timeout vs keepalive"
+$COMPOSE run --rm -T blast blast \
+  -url='https://edge:8443/slow?ms=5000' \
+  -certs=/certs -server-name=edge \
+  -conns=1 -workers=1 -duration=8s -timeout=8s \
+  -max-idle-timeout=2s -keepalive=0s \
+  -log=/logs/smoke-idle.jsonl >/tmp/quicshot-smoke-idle.out 2>&1 || true
+grep -q 'quic_idle_timeout' logs/smoke-idle.jsonl || fail "idle path did not record quic_idle_timeout"
+
+$COMPOSE run --rm -T blast blast \
+  -url='https://edge:8443/slow?ms=5000' \
+  -certs=/certs -server-name=edge \
+  -conns=1 -workers=1 -duration=8s -timeout=8s \
+  -max-idle-timeout=2s -keepalive=1s \
+  -log=/logs/smoke-keepalive.jsonl >/tmp/quicshot-smoke-keepalive.out 2>&1 || true
+if grep -q 'quic_idle_timeout' logs/smoke-keepalive.jsonl; then
+  fail "keepalive path still recorded quic_idle_timeout"
+fi
+grep -q 'conn drops[[:space:]]\+0' /tmp/quicshot-smoke-keepalive.out || fail "keepalive path did not report zero conn drops"
+
+log "checking Alt-Svc on the TCP listener"
+alt=$($COMPOSE run --rm --entrypoint curl blast -skI --http1.1 https://edge:8443/fast || true)
+printf '%s\n' "$alt"
+printf '%s\n' "$alt" | grep -qi 'alt-svc' || fail "TCP listener did not advertise Alt-Svc"
+
+log "checking POST /echo through the tunnel"
+$COMPOSE run --rm -T blast blast \
+  -url=https://edge:8443/echo \
+  -certs=/certs -server-name=edge \
+  -method=POST -body=quicshot-echo \
+  -conns=1 -workers=1 -requests=1 -duration=10s -timeout=5s \
+  -max-failure-pct=0 \
+  -log=/logs/smoke-echo.jsonl >/tmp/quicshot-smoke-echo.out 2>&1
+grep -q 'failures[[:space:]]\+0' /tmp/quicshot-smoke-echo.out || fail "POST /echo reported failures"
+
+if curl --help 2>&1 | grep -q -- '--http3-only'; then
+  log "checking host curl --http3-only"
+  ./scripts/h3-clients.sh curl https://localhost:8443/fast --insecure | tee /tmp/quicshot-smoke-curl.out
+  grep -qi 'HTTP/3' /tmp/quicshot-smoke-curl.out || fail "host curl --http3-only did not negotiate HTTP/3"
+else
+  log "skipping host curl HTTP/3 (this curl has no --http3-only)"
+fi
+
 log "smoke passed"
