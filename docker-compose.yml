@@ -3,6 +3,8 @@ name: quicshot
 x-image: &image
   build:
     context: .
+    args:
+      QUICshot_REVISION: ${QUICshot_REVISION:-dev}
   image: quicshot:local
   user: root # required for tc/netem and writing shared cert/log volumes in the local lab
 

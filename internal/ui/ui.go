@@ -73,8 +73,26 @@ func Main(args []string) error {
 	go s.publishFlow()
 
 	fmt.Printf("\n  QUICshot control panel:  http://%s\n\n", addr)
+	s.warnStaleImage()
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	return srv.ListenAndServe()
+}
+
+func (s *Server) warnStaleImage() {
+	want, err := exec.Command("git", "-C", s.dir, "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return
+	}
+	got, err := exec.Command("docker", "image", "inspect", "quicshot:local",
+		"--format", `{{index .Config.Labels "quicshot.revision"}}`).Output()
+	if err != nil {
+		return
+	}
+	w, g := strings.TrimSpace(string(want)), strings.TrimSpace(string(got))
+	if g == "" || g == "dev" || w == g {
+		return
+	}
+	s.log("ui", "quicshot:local revision "+g+" != source "+w+"; next blast/run will --build")
 }
 
 type Server struct {
@@ -522,83 +540,6 @@ func (s *Server) log(src, line string) {
 	s.hub.publish(map[string]any{"t": "log", "src": src, "line": line, "ts": time.Now().Format("15:04:05")})
 }
 
-// ------------------------------------------------------------------ event bus
-
-type hub struct {
-	mu   sync.Mutex
-	subs map[chan []byte]struct{}
-}
-
-func newHub() *hub { return &hub{subs: map[chan []byte]struct{}{}} }
-
-func (h *hub) sub() chan []byte {
-	c := make(chan []byte, 512)
-	h.mu.Lock()
-	h.subs[c] = struct{}{}
-	h.mu.Unlock()
-	return c
-}
-
-func (h *hub) unsub(c chan []byte) {
-	h.mu.Lock()
-	delete(h.subs, c)
-	h.mu.Unlock()
-	close(c)
-}
-
-func (h *hub) publish(v any) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for c := range h.subs {
-		select {
-		case c <- b:
-		default: // slow client: drop rather than stall the producer
-		}
-	}
-}
-
-func (s *Server) status(running bool, name string) {
-	s.hub.publish(map[string]any{"t": "status", "running": running, "name": name})
-}
-
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	c := s.hub.sub()
-	defer s.hub.unsub(c)
-
-	s.mu.Lock()
-	running, name := s.cancel != nil, s.current
-	s.mu.Unlock()
-	s.status(running, name)
-
-	ping := time.NewTicker(20 * time.Second)
-	defer ping.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case b := <-c:
-			fmt.Fprintf(w, "data: %s\n\n", b)
-			fl.Flush()
-		case <-ping.C:
-			fmt.Fprint(w, ": ping\n\n")
-			fl.Flush()
-		}
-	}
-}
-
 // -------------------------------------------------------------- process plumbing
 
 // runStreaming executes cmd and publishes every output line under src. All
@@ -985,9 +926,10 @@ func (s *Server) handleImpair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := "impair:" + req.Service + ":" + req.Mode
+	script := filepath.Join(s.dir, "scripts", "impair.sh")
 	if err := s.start(name, func(ctx context.Context) {
-		s.log("ui", "$ docker "+strings.Join(tc, " "))
-		if err := s.runStreaming(ctx, "ui", nil, "docker", tc...); err != nil {
+		s.log("ui", "$ "+script+" "+strings.Join(tc, " "))
+		if err := s.runStreaming(ctx, "ui", nil, script, tc...); err != nil {
 			s.log("ui", "impair: "+err.Error())
 		}
 	}); err != nil {
@@ -1008,15 +950,23 @@ func buildImpairCommand(req impairReq) ([]string, error) {
 	if !services[req.Service] || !netemModes[req.Mode] {
 		return nil, errors.New("unknown service or mode")
 	}
-	tc := []string{"compose", "exec", "-T", req.Service, "tc", "qdisc"}
+	args := []string{req.Service, req.Mode}
 	if req.Mode == "clear" {
-		return append(tc, "del", "dev", "eth0", "root"), nil
+		return args, nil
 	}
 	if err := validateNetemInput(req); err != nil {
 		return nil, err
 	}
-	tc = append(tc, "replace", "dev", "eth0", "root", "netem")
-	return append(tc, netemModeArgs(req)...), nil
+	if req.A != "" {
+		args = append(args, req.A)
+	}
+	if req.B != "" {
+		args = append(args, req.B)
+	}
+	if req.Burst != "" {
+		args = append(args, req.Burst)
+	}
+	return args, nil
 }
 
 func validateNetemInput(req impairReq) error {
@@ -1026,33 +976,6 @@ func validateNetemInput(req impairReq) error {
 		}
 	}
 	return nil
-}
-
-func netemModeArgs(req impairReq) []string {
-	switch req.Mode {
-	case "loss":
-		args := []string{"loss", req.A}
-		if req.Burst != "" {
-			args = append(args, req.Burst)
-		}
-		return args
-	case "rate":
-		return []string{"rate", req.A, "limit", "100"}
-	case "delay":
-		args := []string{"delay", req.A}
-		if req.B != "" {
-			args = append(args, req.B, "distribution", "normal")
-		}
-		return args
-	case "reorder":
-		args := []string{"delay", "10ms", "reorder", req.A}
-		if req.B != "" {
-			args = append(args, req.B)
-		}
-		return args
-	default:
-		return nil
-	}
 }
 
 type runReq struct {

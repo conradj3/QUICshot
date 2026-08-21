@@ -1,11 +1,13 @@
 COMPOSE ?= docker compose
+QUICshot_REVISION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+export QUICshot_REVISION
 BLAST   ?= $(COMPOSE) run --rm blast blast -certs=/certs -server-name=edge
 # Point at a real Cloudflare tunnel hostname: make blast-remote URL=https://app.example.com/
 REMOTE  ?= $(COMPOSE) run --rm blast blast
 
 .PHONY: help test ci smoke build build-linux up down logs ps demo demo-auto demo-fast ui ui-stop probe blast blast-remote \
         scenario-524 scenario-hang scenario-loss scenario-idle scenario-buffer scenario-keepalive scenario-invisible \
-        scenario-reset scenario-open scenario-0rtt curl-h3 chrome-h3 rcvbuf-pressure \
+        scenario-reset scenario-open scenario-0rtt curl-h3 chrome-h3 rcvbuf-pressure interop \
         udpstats clear-impair clean
 
 help:
@@ -20,6 +22,9 @@ ci: test build ## Run the same local checks as CI, except the Docker smoke test
 
 smoke: ## Run deterministic Docker end-to-end smoke checks
 	./scripts/smoke.sh
+
+interop: ## In-process HTTP/3 stack test (blast + optional curl)
+	go test ./internal/integration/ -count=1 -timeout 60s
 
 demo: ## Guided end-to-end demo (pauses between acts)
 	./scripts/demo.sh

@@ -8,7 +8,7 @@ QUIC, Cloudflare Tunnel, or UDP-buffer failure mode.
 
 Prerequisites:
 
-- Go 1.25 or newer.
+- Go 1.25 or newer (required by quic-go v0.61).
 - Docker with Compose v2.
 - Optional: `jq`, `tcpdump`, and curl with HTTP/3 support.
 

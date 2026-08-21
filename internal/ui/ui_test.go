@@ -182,6 +182,23 @@ func TestAppendBlastArgsOmitsDefaultNewFlags(t *testing.T) {
 	}
 }
 
+func TestBuildImpairCommandUsesScriptArgs(t *testing.T) {
+	got, err := buildImpairCommand(impairReq{Service: "edge", Mode: "loss", A: "3%"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, " ") != "edge loss 3%" {
+		t.Fatalf("got %v", got)
+	}
+	got, err = buildImpairCommand(impairReq{Service: "edge", Mode: "clear"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, " ") != "edge clear" {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestResolveRunCommandRebuildsComposeImage(t *testing.T) {
 	_, argv, err := resolveRunCommand("docker", []string{"blast", "-url=https://edge:8443/fast"})
 	if err != nil {

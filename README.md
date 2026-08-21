@@ -58,7 +58,7 @@ curl -k --http3-only https://localhost:8443/slow?ms=20000   # -> error code: 524
 Prerequisites:
 
 - Docker with Compose v2.
-- Go 1.25+ for host-side builds and tests.
+- Go 1.25+ for host-side builds and tests (quic-go v0.61 requires it).
 - Optional: `jq`, `tcpdump`, and a curl build with HTTP/3 support for manual debugging.
 
 After cloning, this is the fastest confidence check:
@@ -456,9 +456,13 @@ whether drops follow a replica. `rr` is the default.
 
 ## Still out of scope
 
-This is a tunnel-path failure lab, not an HTTP/3 conformance suite. It does not
-implement WebTransport, HTTP datagrams, CONNECT-UDP/MASQUE, connection migration,
-QUIC v2 / retry / key-update tests, PMTUD, ECN, or a live qvis panel. qlog files
-plus `tcpdump` remain the escape hatch for frame-level work.
+This is a tunnel-path failure lab, not an HTTP/3 conformance suite. QUIC v1 and
+v2 are offered and RFC 9221 datagrams are enabled on every hop; PMTUD stays on
+(quic-go default). It does not implement WebTransport, CONNECT-UDP/MASQUE,
+connection migration, retry/key-update tests, ECN marking, or a live qvis panel.
+qlog files plus `tcpdump` remain the escape hatch for frame-level work.
+
+`go test ./internal/integration` runs the stack in-process (fast / 524 / 1014)
+and, when host curl has `--http3-only`, a second-stack GET against the same edge.
 
 Build without Docker: `go build ./cmd/quicshot`.
