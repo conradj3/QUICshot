@@ -1,0 +1,96 @@
+name: quicshot
+
+x-image: &image
+  build:
+    context: .
+  image: quicshot:local
+  user: root # required for tc/netem and writing shared cert/log volumes in the local lab
+
+services:
+  # One-shot: mint the CA + edge certificate into the shared volume.
+  certs:
+    <<: *image
+    command: ["gencerts", "-dir", "/certs", "-hosts", "edge,localhost,127.0.0.1"]
+    volumes:
+      - certs:/certs
+
+  origin:
+    <<: *image
+    command: ["origin", "-addr", ":8080"]
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  edge:
+    <<: *image
+    command:
+      - edge
+      - -addr=:8443
+      - -tunnel-addr=:7844
+      - -origin-timeout=${EDGE_ORIGIN_TIMEOUT:-10s}
+      - -max-idle-timeout=${EDGE_MAX_IDLE:-30s}
+      - -keepalive=${EDGE_KEEPALIVE:-0s}
+      - -udp-recv-buffer=${EDGE_UDP_RECV_BUFFER:-0}
+      - -qlog-dir=${EDGE_QLOG_DIR:-}
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs
+      - ./logs:/logs
+    ports:
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
+    cap_add:
+      - NET_ADMIN # required by scripts/impair.sh (tc netem)
+
+  connector:
+    <<: *image
+    command:
+      - connector
+      - -edge=edge:7844
+      - -origin=http://origin:8080
+      - -server-name=edge
+      - -max-idle-timeout=${CONNECTOR_MAX_IDLE:-30s}
+      - -keepalive=${CONNECTOR_KEEPALIVE:-5s}
+      - -origin-timeout=${CONNECTOR_ORIGIN_TIMEOUT:-100s}
+      - -qlog-dir=${CONNECTOR_QLOG_DIR:-}
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      origin:
+        condition: service_healthy
+    volumes:
+      - certs:/certs
+      - ./logs:/logs
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      replicas: ${CONNECTOR_REPLICAS:-1}
+
+  # Not started by default: run with `docker compose run --rm blast ...`
+  blast:
+    <<: *image
+    profiles: ["tools"]
+    command:
+      - blast
+      - -url=https://edge:8443/fast
+      - -conns=4
+      - -workers=8
+      - -duration=30s
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    volumes:
+      - certs:/certs
+      - ./logs:/logs
+    cap_add:
+      - NET_ADMIN
+
+volumes:
+  certs:
