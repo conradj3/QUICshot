@@ -5,12 +5,14 @@ package origin
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,6 +24,16 @@ func Main(args []string) error {
 	}
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("role", "origin")
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           newMux(log),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Info("listening", "addr", *addr)
+	return srv.ListenAndServe()
+}
+
+func newMux(log *slog.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -128,13 +140,56 @@ func Main(args []string) error {
 		w.Write([]byte("ok\n"))
 	})
 
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	log.Info("listening", "addr", *addr)
-	return srv.ListenAndServe()
+	// /echo returns the request body. Used to prove POST / request-stream flow
+	// control through the tunnel.
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("content-type", r.Header.Get("content-type"))
+		w.Header().Set("x-echo-bytes", strconv.Itoa(len(b)))
+		w.Write(b)
+	})
+
+	// /headers?n=N&size=S writes N response headers of S bytes each. This is a
+	// QPACK / header-block stress lever, not a full encoder fuzzer.
+	mux.HandleFunc("/headers", func(w http.ResponseWriter, r *http.Request) {
+		n := min(intParam(r, "n", 32), 256)
+		size := min(intParam(r, "size", 64), 2048)
+		pad := strings.Repeat("x", size)
+		for i := 0; i < n; i++ {
+			w.Header().Set(fmt.Sprintf("x-stress-%d", i), pad)
+		}
+		fmt.Fprintf(w, "headers=%d size=%d\n", n, size)
+	})
+
+	// /stall?ms=N sleeps before and while reading the body. Useful for holding
+	// streams open; it is not a substitute for kernel UDP RcvbufErrors.
+	mux.HandleFunc("/stall", func(w http.ResponseWriter, r *http.Request) {
+		gap := durationParam(r, "ms", 250*time.Millisecond)
+		if r.Body != nil {
+			buf := make([]byte, 1)
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				default:
+				}
+				_, err := r.Body.Read(buf)
+				if err != nil {
+					break
+				}
+				time.Sleep(gap)
+			}
+		} else {
+			time.Sleep(gap)
+		}
+		w.Write([]byte("stalled\n"))
+	})
+
+	return mux
 }
 
 func intParam(r *http.Request, name string, def int) int {
