@@ -1,31 +1,58 @@
-name: ci
+name: PR validation
 
 on:
-  push:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  go:
+  go-quality:
+    name: Go quality gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - run: test -z "$(gofmt -l .)"
-      - run: go test ./...
-      - run: go vet ./...
+      - name: Format, test, and vet
+        run: make test
 
-  docker:
+  docker-build:
+    name: Docker build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - run: docker build .
+      - name: Build image
+        run: docker build .
 
-  smoke:
+  compose-smoke:
+    name: Compose smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - run: ./scripts/smoke.sh
+      - name: Validate compose config
+        run: docker compose config >/tmp/quicshot-compose.yml
+      - name: Run smoke test
+        run: make smoke
+      - name: Upload smoke logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            logs/*.jsonl
+            logs/qlog/**/*.sqlog
+          if-no-files-found: ignore
