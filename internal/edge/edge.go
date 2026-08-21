@@ -15,9 +15,11 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/conrad/quicshot/internal/certs"
 	"github.com/conrad/quicshot/internal/qlogtrace"
+	"github.com/conrad/quicshot/internal/quiccfg"
 	"github.com/conrad/quicshot/internal/quicerr"
 	"github.com/conrad/quicshot/internal/udpsock"
 )
@@ -56,6 +59,9 @@ type Edge struct {
 	connectors      []connectorRef
 	rr              atomic.Uint64
 	nextConnectorID atomic.Uint64
+
+	publicBound string
+	tunnelBound string
 }
 
 type connectorRef struct {
@@ -96,12 +102,71 @@ func Main(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	return e.Start(ctx, cert)
+}
+
+// Start serves the tunnel and public listeners until ctx is cancelled.
+func (e *Edge) Start(ctx context.Context, cert tls.Certificate) error {
 	if err := e.serveTunnel(ctx, cert); err != nil {
 		return err
 	}
 	go e.logUDPCounters(ctx)
-
 	return e.servePublic(ctx, cert)
+}
+
+// PublicAddr is the bound HTTP/3 address after Start (host:port).
+func (e *Edge) PublicAddr() string { return e.publicBound }
+
+// TunnelAddr is the bound connector listener after Start.
+func (e *Edge) TunnelAddr() string { return e.tunnelBound }
+
+// StartLocal binds ephemeral ports and serves until ctx is cancelled.
+func StartLocal(ctx context.Context, certDir, publicAddr, tunnelAddr string, originTimeout time.Duration) (*Edge, error) {
+	cert, err := tls.LoadX509KeyPair(certDir+"/"+certs.CertFile, certDir+"/"+certs.KeyFile)
+	if err != nil {
+		return nil, err
+	}
+	e := &Edge{
+		cfg: config{
+			publicAddr:      publicAddr,
+			tunnelAddr:      tunnelAddr,
+			certDir:         certDir,
+			originTimeout:   originTimeout,
+			maxIdle:         30 * time.Second,
+			tunnelMaxIdle:   30 * time.Second,
+			tunnelKeepAlive: 5 * time.Second,
+			tunnelLB:        "rr",
+		},
+		log: slog.New(slog.NewJSONHandler(io.Discard, nil)).With("role", "edge"),
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- e.Start(ctx, cert) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if e.PublicAddr() != "" && e.TunnelAddr() != "" {
+			return e, nil
+		}
+		select {
+		case err := <-errCh:
+			if err != nil {
+				return nil, err
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return nil, fmt.Errorf("edge did not bind public/tunnel listeners")
+}
+
+func tcpAddrForUDP(addr net.Addr) string {
+	ua, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return addr.String()
+	}
+	host := ""
+	if ua.IP != nil && !ua.IP.IsUnspecified() {
+		host = ua.IP.String()
+	}
+	return net.JoinHostPort(host, strconv.Itoa(ua.Port))
 }
 
 // ---------------------------------------------------------------- tunnel side
@@ -114,11 +179,8 @@ func (e *Edge) serveTunnel(ctx context.Context, cert tls.Certificate) error {
 	}
 	// The tunnel hop uses its own idle/keepalive knobs, independent of the
 	// public HTTP/3 hop. Defaults match cloudflared's edge connection shape.
-	quicConf := &quic.Config{
-		MaxIdleTimeout:     e.cfg.tunnelMaxIdle,
-		KeepAlivePeriod:    e.cfg.tunnelKeepAlive,
-		MaxIncomingStreams: 1 << 14,
-	}
+	quicConf := quiccfg.Server(e.cfg.tunnelMaxIdle, e.cfg.tunnelKeepAlive)
+	quicConf.MaxIncomingStreams = 1 << 14
 	if err := qlogtrace.Configure(quicConf, e.cfg.qlogDir); err != nil {
 		return err
 	}
@@ -126,7 +188,8 @@ func (e *Edge) serveTunnel(ctx context.Context, cert tls.Certificate) error {
 	if err != nil {
 		return fmt.Errorf("listen for connectors: %w", err)
 	}
-	e.log.Info("tunnel listener up", "addr", e.cfg.tunnelAddr, "alpn", certs.TunnelALPN,
+	e.tunnelBound = ln.Addr().String()
+	e.log.Info("tunnel listener up", "addr", e.tunnelBound, "alpn", certs.TunnelALPN,
 		"max_idle_timeout", e.cfg.tunnelMaxIdle.String(),
 		"keepalive", e.cfg.tunnelKeepAlive.String(),
 		"lb", e.cfg.tunnelLB)
@@ -198,11 +261,7 @@ func pickConnectorIndex(n int, key, mode string, rr *atomic.Uint64) int {
 // ---------------------------------------------------------------- public side
 
 func (e *Edge) servePublic(ctx context.Context, cert tls.Certificate) error {
-	quicConf := &quic.Config{
-		MaxIdleTimeout:  e.cfg.maxIdle,
-		KeepAlivePeriod: e.cfg.keepAlive,
-		Allow0RTT:       true,
-	}
+	quicConf := quiccfg.Server(e.cfg.maxIdle, e.cfg.keepAlive)
 	if err := qlogtrace.Configure(quicConf, e.cfg.qlogDir); err != nil {
 		return err
 	}
@@ -212,9 +271,11 @@ func (e *Edge) servePublic(ctx context.Context, cert tls.Certificate) error {
 		return fmt.Errorf("public udp socket: %w", err)
 	}
 	defer udpConn.Close()
+	e.publicBound = udpConn.LocalAddr().String()
+	tcpAddr := tcpAddrForUDP(udpConn.LocalAddr())
 
 	h3 := &http3.Server{
-		Addr:       e.cfg.publicAddr,
+		Addr:       e.publicBound,
 		Handler:    e,
 		TLSConfig:  http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}),
 		QUICConfig: quicConf,
@@ -222,7 +283,7 @@ func (e *Edge) servePublic(ctx context.Context, cert tls.Certificate) error {
 	}
 
 	tcpSrv := &http.Server{
-		Addr: e.cfg.publicAddr,
+		Addr: tcpAddr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			h3.SetQUICHeaders(w.Header())
 			e.ServeHTTP(w, r)
@@ -233,7 +294,7 @@ func (e *Edge) servePublic(ctx context.Context, cert tls.Certificate) error {
 
 	errCh := make(chan error, 2)
 	go func() {
-		e.log.Info("h3 listener up", "addr", e.cfg.publicAddr,
+		e.log.Info("h3 listener up", "addr", e.publicBound,
 			"origin_timeout", e.cfg.originTimeout.String(),
 			"max_idle_timeout", e.cfg.maxIdle.String(),
 			"keepalive", e.cfg.keepAlive.String(),
@@ -242,7 +303,7 @@ func (e *Edge) servePublic(ctx context.Context, cert tls.Certificate) error {
 		errCh <- h3.Serve(udpConn)
 	}()
 	go func() {
-		e.log.Info("tcp tls listener up", "addr", e.cfg.publicAddr)
+		e.log.Info("tcp tls listener up", "addr", tcpAddr)
 		errCh <- tcpSrv.ListenAndServeTLS("", "")
 	}()
 

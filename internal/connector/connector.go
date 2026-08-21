@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/conrad/quicshot/internal/certs"
 	"github.com/conrad/quicshot/internal/qlogtrace"
+	"github.com/conrad/quicshot/internal/quiccfg"
 	"github.com/conrad/quicshot/internal/quicerr"
 )
 
@@ -37,8 +39,6 @@ func Main(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("role", "connector")
 
 	tlsConf := &tls.Config{
 		NextProtos:         []string{certs.TunnelALPN},
@@ -64,19 +64,36 @@ func Main(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return Start(ctx, StartOpts{
+		EdgeAddr: *edgeAddr, OriginURL: *originURL, TLS: tlsConf,
+		Idle: *maxIdle, KeepAlive: *keepAlive, QlogDir: *qlogDir, Origin: origin,
+	})
+}
 
+// StartOpts is the in-process connector configuration used by tests.
+type StartOpts struct {
+	EdgeAddr, OriginURL, QlogDir string
+	TLS                          *tls.Config
+	Idle, KeepAlive              time.Duration
+	Origin                       *http.Client
+	Log                          *slog.Logger
+}
+
+// Start dials the edge and serves origin proxy streams until ctx is cancelled.
+func Start(ctx context.Context, opts StartOpts) error {
+	log := opts.Log
+	if log == nil {
+		log = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("role", "connector")
+	}
 	backoff := 500 * time.Millisecond
 	for ctx.Err() == nil {
 		err := runOnce(ctx, log, runConfig{
-			edgeAddr:  *edgeAddr,
-			originURL: *originURL,
-			tlsConf:   tlsConf,
-			quicConf: &quic.Config{
-				MaxIdleTimeout:  *maxIdle,
-				KeepAlivePeriod: *keepAlive,
-			},
-			qlogDir: *qlogDir,
-			origin:  origin,
+			edgeAddr:  opts.EdgeAddr,
+			originURL: opts.OriginURL,
+			tlsConf:   opts.TLS,
+			quicConf:  quiccfg.Client(opts.Idle, opts.KeepAlive),
+			qlogDir:   opts.QlogDir,
+			origin:    opts.Origin,
 		})
 		if ctx.Err() != nil {
 			return nil
@@ -149,7 +166,7 @@ func serveStream(log *slog.Logger, str *quic.Stream, originURL string, client *h
 
 	outbound, err := http.NewRequestWithContext(reqCtx, req.Method, target, req.Body)
 	if err != nil {
-		writeStatus(str, http.StatusBadRequest)
+		_ = writeStatus(str, http.StatusBadRequest)
 		return
 	}
 	outbound.Header = req.Header.Clone()
@@ -158,7 +175,7 @@ func serveStream(log *slog.Logger, str *quic.Stream, originURL string, client *h
 	start := time.Now()
 	resp, err := client.Do(outbound)
 	if err != nil {
-		if reqCtx.Err() != nil {
+		if !resetTunnelOnOriginError(err, reqCtx.Err()) {
 			log.Info("origin request abandoned by edge", "stream", int64(str.StreamID()),
 				"target", target, "elapsed_ms", time.Since(start).Milliseconds())
 			return
@@ -183,7 +200,7 @@ func serveStream(log *slog.Logger, str *quic.Stream, originURL string, client *h
 		"status", resp.StatusCode, "elapsed_ms", time.Since(start).Milliseconds())
 }
 
-func writeStatus(str *quic.Stream, code int) {
+func writeStatus(w io.Writer, code int) error {
 	resp := &http.Response{
 		StatusCode: code,
 		ProtoMajor: 1,
@@ -191,5 +208,14 @@ func writeStatus(str *quic.Stream, code int) {
 		Header:     http.Header{},
 		Body:       http.NoBody,
 	}
-	resp.Write(str)
+	return resp.Write(w)
+}
+
+// resetTunnelOnOriginError reports whether an origin dial/request error should
+// cancel the tunnel stream (so the edge emits 1014) instead of writing a 502.
+func resetTunnelOnOriginError(originErr, reqCtxErr error) bool {
+	if originErr == nil {
+		return false
+	}
+	return reqCtxErr == nil
 }

@@ -3,11 +3,15 @@
 package origin
 
 import (
+	"context"
 	"flag"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -19,13 +23,37 @@ func Main(args []string) error {
 	}
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("role", "origin")
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           newMux(log),
-		ReadHeaderTimeout: 10 * time.Second,
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if _, err := Listen(ctx, *addr, log); err != nil {
+		return err
 	}
-	log.Info("listening", "addr", *addr)
-	return srv.ListenAndServe()
+	<-ctx.Done()
+	return nil
+}
+
+// Listen serves the origin until ctx is cancelled. The returned address is the
+// bound host:port, which is useful when addr ends in :0.
+func Listen(ctx context.Context, addr string, log *slog.Logger) (string, error) {
+	if log == nil {
+		log = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("role", "origin")
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return "", err
+	}
+	srv := &http.Server{Handler: newMux(log), ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	bound := ln.Addr().String()
+	log.Info("listening", "addr", bound)
+	go func() { _ = srv.Serve(ln) }()
+	if ctx.Err() != nil {
+		return bound, ctx.Err()
+	}
+	return bound, nil
 }
 
 func newMux(log *slog.Logger) *http.ServeMux {

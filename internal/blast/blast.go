@@ -30,6 +30,7 @@ import (
 
 	"github.com/conrad/quicshot/internal/certs"
 	"github.com/conrad/quicshot/internal/qlogtrace"
+	"github.com/conrad/quicshot/internal/quiccfg"
 	"github.com/conrad/quicshot/internal/quicerr"
 	"github.com/conrad/quicshot/internal/udpsock"
 )
@@ -408,7 +409,7 @@ func tlsConfig(cfg config) (*tls.Config, error) {
 }
 
 func quicConfig(cfg config) (*quic.Config, error) {
-	quicConf := &quic.Config{MaxIdleTimeout: cfg.maxIdle, KeepAlivePeriod: cfg.keepAlive}
+	quicConf := quiccfg.Client(cfg.maxIdle, cfg.keepAlive)
 	if err := qlogtrace.Configure(quicConf, cfg.qlogDir); err != nil {
 		return nil, err
 	}
