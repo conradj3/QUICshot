@@ -20,9 +20,9 @@ make smoke
 ```
 
 `make smoke` builds the image, starts the local stack, verifies HTTP/3 on the
-fast path, verifies qlog output, checks the 524 path, checks connector-down
-1033 behavior, and cleans up afterward. Use `KEEP_STACK=1 make smoke` to leave
-the containers running for inspection.
+fast path, verifies qlog output, then checks 524, 1033, origin RST (1014),
+invisible client-deadline, idle vs keepalive, Alt-Svc, and POST `/echo`. Use
+`KEEP_STACK=1 make smoke` to leave the containers running for inspection.
 
 ## Code Style
 
