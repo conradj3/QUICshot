@@ -4,7 +4,8 @@ BLAST   ?= $(COMPOSE) run --rm blast blast -certs=/certs -server-name=edge
 REMOTE  ?= $(COMPOSE) run --rm blast blast
 
 .PHONY: help test ci smoke build build-linux up down logs ps demo demo-auto demo-fast ui ui-stop probe blast blast-remote \
-        scenario-524 scenario-hang scenario-loss scenario-idle scenario-buffer \
+        scenario-524 scenario-hang scenario-loss scenario-idle scenario-buffer scenario-keepalive scenario-invisible \
+        scenario-reset scenario-open scenario-0rtt curl-h3 chrome-h3 rcvbuf-pressure \
         udpstats clear-impair clean
 
 help:
@@ -90,7 +91,31 @@ scenario-idle: ## No keep-alives + slow origin -> client-side idle timeouts
 	EDGE_MAX_IDLE=5s EDGE_KEEPALIVE=0s $(COMPOSE) up -d --force-recreate edge
 	$(BLAST) -url='https://edge:8443/slow?ms=8000' -conns=2 -workers=2 -duration=60s -keepalive=0s -max-idle-timeout=5s -log=/logs/idle.jsonl
 
-scenario-buffer: ## Rate-limit the edge to build a UDP backlog, watch RcvbufErrors
+scenario-keepalive: ## Same as idle, with keep-alives — expect zero connection drops
+	$(BLAST) -url='https://edge:8443/slow?ms=8000' -conns=2 -workers=2 -duration=60s -keepalive=1s -max-idle-timeout=5s -log=/logs/keepalive.jsonl
+
+scenario-invisible: ## Client timeout shorter than the edge origin timeout: client_deadline, no 524
+	$(BLAST) -url='https://edge:8443/slow?ms=20000' -conns=1 -workers=2 -duration=15s -timeout=3s -log=/logs/invisible.jsonl
+
+scenario-reset: ## Origin RSTs the TCP socket -> 502 / error code 1014
+	$(BLAST) -url=https://edge:8443/reset -conns=1 -workers=1 -requests=4 -duration=15s -timeout=5s -log=/logs/reset.jsonl
+
+scenario-open: ## Open-loop 100 rps; offered load does not collapse when latency rises
+	$(BLAST) -url=https://edge:8443/fast -mode=open -rps=100 -max-inflight=128 -conns=4 -workers=8 -duration=20s -log=/logs/open.jsonl
+
+scenario-0rtt: ## Dial twice and record whether the second handshake used 0-RTT
+	$(BLAST) -url=https://edge:8443/fast -probe-0rtt -conns=1 -workers=1 -requests=1 -duration=5s -log=/logs/0rtt.jsonl
+
+curl-h3: ## HTTP/3 GET with curl --http3-only (host curl or helper image)
+	./scripts/h3-clients.sh curl $(or $(URL),https://localhost:8443/fast) --insecure
+
+chrome-h3: ## Headless Chrome forced onto HTTP/3 (skips if Chrome is not installed)
+	./scripts/h3-clients.sh chrome $(or $(URL),https://localhost:8443/fast) --insecure
+
+rcvbuf-pressure: ## Linux-only attempt to move Udp RcvbufErrors (exits 2 on Docker Desktop)
+	./scripts/rcvbuf-pressure.sh
+
+scenario-buffer: ## Rate-limit the edge to build a UDP backlog, watch SndbufErrors
 	./scripts/impair.sh edge rate 5mbit
 	$(BLAST) -url='https://edge:8443/bytes?n=8388608' -conns=8 -workers=16 -duration=60s -log=/logs/buffer.jsonl
 	$(MAKE) udpstats
