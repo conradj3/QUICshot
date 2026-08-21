@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QUICshot control panel</title>
+<style>
+  :root {
+    --bg:#0b0f16; --panel:#121822; --panel2:#171f2b; --line:#242e3d; --line2:#31405480;
+    --fg:#dbe3ee; --dim:#8496ad; --faint:#5d6d84;
+    --accent:#5eb3ff; --accent2:#7c5cff;
+    --ok:#3fd68c; --warn:#f0b429; --err:#ff6b6b;
+    --r:8px;
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body {
+    margin:0; overflow:hidden; display:flex; flex-direction:column;
+    background:var(--bg); color:var(--fg);
+    font:13px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:#2b3646; border-radius:5px; border:2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background:#3a4759; }
+
+  header {
+    flex:0 0 auto; display:flex; align-items:center; gap:16px; padding:0 16px; height:52px;
+    background:linear-gradient(180deg,#161e2a,#121822); border-bottom:1px solid var(--line);
+  }
+  .brand { display:flex; align-items:baseline; gap:9px; font-weight:650; letter-spacing:.2px; }
+  .brand .dotlogo { width:9px; height:9px; border-radius:50%; align-self:center;
+    background:linear-gradient(135deg,var(--accent),var(--accent2)); box-shadow:0 0 12px #5eb3ff88; }
+  .brand small { color:var(--faint); font-weight:400; font-size:11.5px; }
+  .pill { display:flex; align-items:center; gap:7px; padding:4px 11px; border-radius:99px;
+    background:#0f1621; border:1px solid var(--line); font:11.5px ui-monospace,monospace; color:var(--dim); }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--faint); transition:.2s; }
+  .dot.run { background:var(--ok); animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0% { box-shadow:0 0 0 0 #3fd68c99; } 70% { box-shadow:0 0 0 7px #3fd68c00; }
+                     100% { box-shadow:0 0 0 0 #3fd68c00; } }
+  .stats { display:flex; gap:6px; }
+  .stat { padding:4px 9px; border-radius:6px; background:#0f1621; border:1px solid var(--line);
+    font:11px ui-monospace,monospace; color:var(--faint); white-space:nowrap; }
+  .stat b { color:var(--fg); font-weight:600; }
+  .stat.bad { border-color:#7a2b2b; background:#1d1214; }
+  .stat.bad b { color:var(--err); }
+  .spacer { margin-left:auto; }
+
+  .layout { flex:1; min-height:0; display:grid; grid-template-columns:352px 1fr; }
+  aside.side { min-height:0; overflow-y:auto; overflow-x:hidden; padding:13px;
+          background:var(--panel); border-right:1px solid var(--line); }
+  main { min-height:0; min-width:0; display:flex; flex-direction:column; }
+
+  .card { border:1px solid var(--line); border-radius:var(--r); background:var(--panel2);
+          padding:12px; margin-bottom:12px; }
+  .card > h2 { display:flex; align-items:center; gap:7px; font-size:10.5px; text-transform:uppercase;
+    letter-spacing:1px; color:var(--faint); margin:0 0 10px; font-weight:700; }
+  label { display:block; font-size:10.5px; color:var(--dim); margin:8px 0 3px; letter-spacing:.2px; }
+  label[title] { cursor:help; border-bottom:1px dotted var(--line2); display:inline-block; }
+  input, select {
+    width:100%; background:#0c1219; color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:6px 8px; font:12px ui-monospace,SFMono-Regular,monospace;
+    transition:border-color .15s, box-shadow .15s;
+  }
+  input:focus, select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px #5eb3ff22; }
+  input::placeholder { color:#4a5a70; }
+  .row { display:flex; gap:7px; }
+  .row > * { flex:1; min-width:0; }
+  button {
+    background:#1b2432; color:var(--fg); border:1px solid var(--line); border-radius:6px;
+    padding:6px 11px; font-size:11.5px; font-weight:500; cursor:pointer; transition:.14s; white-space:nowrap;
+  }
+  button:hover:not(:disabled) { background:#222d3d; border-color:#4a5d78; color:#fff; }
+  button:active:not(:disabled) { background:#161e2a; }
+  button.primary { background:linear-gradient(180deg,#5eb3ff,#3d95e8); color:#08111c;
+                   border-color:#5eb3ff; font-weight:650; }
+  button.primary:hover:not(:disabled) { background:linear-gradient(180deg,#79c2ff,#4ba2f2); }
+  button.ghost { background:transparent; }
+  button.danger { color:var(--err); border-color:#4a2630; }
+  button.danger:hover:not(:disabled) { background:#2a161b; }
+  button:disabled { opacity:.35; cursor:not-allowed; }
+  button.tgl.on { border-color:var(--accent); color:var(--accent); background:#12202e; }
+  .btns { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .hint { font-size:10.5px; color:var(--faint); margin-top:9px; line-height:1.5; }
+
+  .toolbar { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 12px;
+    background:var(--panel); border-bottom:1px solid var(--line); }
+  .chip { font:11px ui-monospace,monospace; padding:3px 10px; border-radius:99px; user-select:none;
+    border:1px solid var(--line); color:var(--faint); cursor:pointer; transition:.14s; }
+  .chip:hover { border-color:#3a4a61; }
+  .chip.on { color:#0b0f16; font-weight:600; }
+  .chip.on[data-f=edge]      { background:#79c0ff; border-color:#79c0ff; }
+  .chip.on[data-f=connector] { background:#c9a2ff; border-color:#c9a2ff; }
+  .chip.on[data-f=origin]    { background:#7ee787; border-color:#7ee787; }
+  .chip.on[data-f=run]       { background:#ffb26b; border-color:#ffb26b; }
+  .chip.on[data-f=ui]        { background:#94a5bb; border-color:#94a5bb; }
+  .toolbar input[type=search] { width:210px; }
+  .toolbar .lbl { font-size:11px; color:var(--dim); display:flex; align-items:center; gap:5px;
+                  cursor:pointer; white-space:nowrap; }
+  .toolbar .lbl input { width:auto; }
+
+  .logwrap { flex:1; min-height:0; position:relative; }
+  #log { position:absolute; inset:0; overflow-y:auto; overflow-x:hidden; padding:8px 0 14px;
+    font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .l { display:flex; gap:10px; padding:1px 14px; }
+  .l:hover { background:#ffffff06; }
+  .l .ts  { flex:0 0 54px; color:#455467; user-select:none; }
+  .l .src { flex:0 0 72px; text-align:right; user-select:none; font-weight:600; }
+  .l .msg { flex:1; min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; color:#b9c6d6; }
+  .src-edge      { color:#79c0ff; }
+  .src-connector { color:#c9a2ff; }
+  .src-origin    { color:#7ee787; }
+  .src-blast, .src-probe { color:#ffb26b; }
+  .src-ui        { color:#8496ad; }
+  .msg.err  { color:var(--err); }
+  .msg.warn { color:var(--warn); }
+  .msg.good { color:var(--ok); }
+  .msg.hl   { text-shadow:0 0 12px #ff6b6b55; }
+  #newBadge { position:absolute; left:50%; transform:translateX(-50%); bottom:16px; display:none;
+    background:var(--accent); color:#08111c; font-weight:650; font-size:11.5px; padding:6px 14px;
+    border:0; border-radius:99px; cursor:pointer; box-shadow:0 6px 20px #000a; }
+  #newBadge.show { display:block; }
+  .empty { color:var(--faint); padding:26px 16px; font-family:ui-sans-serif,sans-serif; }
+
+  #flow { flex:0 0 auto; display:flex; align-items:stretch; padding:13px 16px 11px;
+    background:linear-gradient(180deg,#101722,#0d131c); border-bottom:1px solid var(--line); }
+  .fnode { flex:0 0 auto; min-width:134px; border:1px solid var(--line); border-radius:9px;
+    background:#141c28; padding:8px 11px; transition:border-color .25s, box-shadow .25s, opacity .25s; cursor:pointer; }
+  .fnode.sel { border-color:var(--accent); box-shadow:0 0 0 2px #5eb3ff22, 0 0 18px #5eb3ff22; }
+  .fnode.hot { border-color:#3f7fb8; box-shadow:0 0 18px #5eb3ff22; }
+  .fnode.bad { border-color:#8a3b3b; box-shadow:0 0 18px #ff6b6b22; }
+  .fnode.down { border-color:#8a3b3b; background:#1a1216; opacity:.8; }
+  .fname { font-size:10px; text-transform:uppercase; letter-spacing:1px; color:var(--faint);
+    font-weight:700; margin-bottom:2px; }
+  .fsub { font:10px ui-monospace,monospace; color:#4d5c72; margin-bottom:5px; }
+  .fmetric { font:12px ui-monospace,monospace; display:flex; gap:9px; flex-wrap:wrap; }
+  .fmetric .m { color:var(--dim); }
+  .fmetric .m b { color:var(--fg); font-weight:600; }
+  .fmetric .m.err b { color:var(--err); }
+  .fmetric .m.ok b { color:var(--ok); }
+  .flink { flex:1 1 auto; min-width:40px; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; padding:0 7px; }
+  .flabel { font:9.5px ui-monospace,monospace; color:#4d5c72; margin-bottom:5px;
+    letter-spacing:.4px; white-space:nowrap; }
+  .flink .bar { width:100%; height:2px; background:#243043; border-radius:2px;
+    position:relative; overflow:hidden; }
+  .flink.active .bar { background:#1d3b56; }
+  .flink.active .bar::after { content:''; position:absolute; top:0; bottom:0; width:34%;
+    background:linear-gradient(90deg,transparent,#5eb3ff,transparent); animation:slide 1.1s linear infinite; }
+  .flink.err .bar { background:#4a2029; }
+  .flink.err .bar::after { background:linear-gradient(90deg,transparent,#ff6b6b,transparent); }
+  .flink.dead .bar { background:#4a2029; }
+  .flink.dead .bar::after { display:none; }
+  @keyframes slide { from { left:-40%; } to { left:100%; } }
+  .fbadge { font:9.5px ui-monospace,monospace; margin-top:6px; padding:1px 7px; border-radius:99px;
+    border:1px solid #6b4a1f; background:#241a0d; color:var(--warn); white-space:nowrap; }
+  .fbadge:empty { display:none; border:0; padding:0; }
+  #componentMetrics { font:11.5px ui-monospace,monospace; color:var(--dim); }
+  .metricLine { display:flex; justify-content:space-between; gap:10px; padding:3px 0; border-top:1px solid #24304380; }
+  .metricLine:first-child { border-top:0; }
+  .metricLine b { color:var(--fg); font-weight:600; text-align:right; }
+
+  .chip.on#prettyChip { background:var(--accent); border-color:var(--accent); }
+  .kv { display:inline-flex; gap:3px; margin-right:9px; white-space:nowrap; }
+  .kv .k { color:#6c7f97; }
+  .kv .v { color:#c6d3e3; }
+  .kv.hot .v { color:#ffd479; font-weight:600; }
+  .kv.bad .v { color:var(--err); font-weight:600; }
+  .lvl { flex:0 0 44px; text-align:center; font-size:10px; font-weight:700; letter-spacing:.5px;
+    border-radius:4px; padding:0 4px; height:17px; line-height:17px; user-select:none; }
+  .lvl-INFO  { color:#79c0ff; background:#12202e; }
+  .lvl-WARN  { color:var(--warn); background:#241a0d; }
+  .lvl-ERROR { color:var(--err); background:#241316; }
+  .lvl-DEBUG { color:var(--faint); background:#161d27; }
+  .pmsg { font-weight:600; color:#e6edf6; margin-right:10px; }
+
+  #help { position:fixed; top:0; right:0; bottom:0; width:min(580px,94vw); background:var(--panel);
+    border-left:1px solid var(--line); box-shadow:-20px 0 60px #0009;
+    transform:translateX(102%); transition:transform .22s cubic-bezier(.4,0,.2,1); z-index:60;
+    display:flex; flex-direction:column; }
+  #help.open { transform:none; }
+  #help > header { background:none; }
+  #help .body { flex:1; min-height:0; overflow-y:auto; padding:16px 20px 44px; }
+  #help h3 { font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--accent);
+    margin:24px 0 8px; }
+  #help h3:first-child { margin-top:0; }
+  #help p { color:var(--dim); margin:6px 0; font-size:12.5px; }
+  #help table { width:100%; border-collapse:collapse; margin:8px 0 4px; }
+  #help td { padding:6px 8px 6px 0; vertical-align:top; font-size:12px; border-top:1px solid var(--line); }
+  #help td:first-child { width:158px; color:var(--fg); font:11.5px ui-monospace,monospace; }
+  #help td:last-child { color:var(--dim); }
+  #help code { background:#0c1219; border:1px solid var(--line); border-radius:4px;
+    padding:1px 5px; font:11.5px ui-monospace,monospace; color:#9fd0ff; }
+  #scrim { position:fixed; inset:0; background:#000a; opacity:0; pointer-events:none;
+    transition:opacity .22s; z-index:59; }
+  #scrim.open { opacity:1; pointer-events:auto; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand"><span class="dotlogo"></span>QUICshot <small>HTTP/3 tunnel test rig</small></div>
+  <div class="pill"><span class="dot" id="dot"></span><span id="runName">idle</span></div>
+  <div class="stats" id="stats"><span class="stat">udp <b>—</b></span></div>
+  <div class="spacer"></div>
+  <button class="ghost" id="helpBtn" title="Open the help drawer (Esc to close)">? Help</button>
+  <button class="danger" id="stop" disabled title="Cancel the run in progress">&#9632; Stop</button>
+</header>
+
+<div class="layout">
+<aside class="side" aria-label="Controls">
+
+  <div class="card">
+    <h2>&#9635; Stack</h2>
+    <div class="row">
+      <div>
+        <label title="How long the edge waits for the origin before returning 524. Cloudflare's real value is 100s; keep it short here so failures happen fast.">origin timeout</label>
+        <input id="originTimeout" value="10s">
+      </div>
+      <div>
+        <label title="QUIC max idle timeout the edge applies to CLIENT connections. No packet for this long and the connection dies.">edge max idle</label>
+        <input id="maxIdle" value="30s">
+      </div>
+      <div>
+        <label title="How often the edge sends QUIC keep-alives to clients. 0 disables them, which is the fastest way to reproduce idle disconnects.">edge keepalive</label>
+        <input id="keepAlive" value="0s">
+      </div>
+    </div>
+    <div class="btns">
+      <button class="primary" data-stack="up" title="Build and start origin + edge + connector">&#9654; Up</button>
+      <button data-stack="restart-edge" title="Recreate ONLY the edge container using the three values above">&#8635; Apply to edge</button>
+      <button data-stack="down" title="Stop and remove all containers and volumes">&#9632; Down</button>
+    </div>
+    <div class="row">
+      <div>
+        <label for="connectors" title="How many connector replicas should dial out to the edge. 0 intentionally reproduces the no-connector / 1033 path.">connector replicas</label>
+        <input id="connectors" type="number" min="0" max="10" value="1">
+      </div>
+      <div style="display:flex; align-items:end; gap:6px">
+        <button data-stack="scale-connectors" title="Apply the connector replica count above">Scale</button>
+        <button data-stack="start-connector" title="Bring connector service back after the No connector scenario">Restore 1</button>
+      </div>
+    </div>
+    <div class="btns">
+      <button data-stack="stop-connector" title="Stop the connector. The edge then has no tunnel and returns 502 / error code 1033.">&#10005; Kill connector</button>
+    </div>
+    <div class="hint">After <b>No connector</b>, press <b>Restore 1</b> or set replicas and press <b>Scale</b>. The flow diagram updates when connectors re-register.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#9638; Component metrics</h2>
+    <div id="componentMetrics">Click client, edge, connector, or origin in the flow view.</div>
+    <div class="hint">Scenarios and manual blast/probe runs can start a new test and reset these counters.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#9672; Impairment</h2>
+    <div class="row">
+      <div>
+        <label title="Which container's eth0 to shape. The edge shares eth0 with BOTH hops, so pick connector to impair only the tunnel hop.">target</label>
+        <select id="impSvc"><option>edge</option><option>connector</option><option>origin</option></select>
+      </div>
+      <div>
+        <label title="loss = drop a percentage of packets · rate = cap bandwidth · delay = add latency · reorder = deliver out of order">mode</label>
+        <select id="impMode"><option>loss</option><option>rate</option><option>delay</option><option>reorder</option></select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label title="loss: 3%   ·   rate: 5mbit   ·   delay: 80ms   ·   reorder: 5%">value</label>
+        <input id="impA" value="3%" placeholder="3%">
+      </div>
+      <div>
+        <label title="delay: jitter such as 30ms. reorder: correlation such as 50%. Leave blank for loss and rate.">jitter / corr</label>
+        <input id="impB" placeholder="optional">
+      </div>
+    </div>
+    <div class="btns">
+      <button data-impair="apply" title="Attach the netem qdisc to eth0 inside the chosen container">Apply</button>
+      <button data-impair="clear" title="Remove all shaping from that container">Clear</button>
+    </div>
+    <div class="hint">netem on a multi-queue veth is applied unevenly &mdash; read the kernel counters and the
+      latency <em>tail</em>, not the median.</div>
+  </div>
+
+  <div class="card">
+    <h2>&#9889; Traffic</h2>
+    <label title="Target URL. Use the local edge for scenarios, or any public HTTPS host to test a real tunnel.">target url</label>
+    <input id="url" value="https://edge:8443/fast">
+    <div class="btns" style="margin-top:7px">
+      <button data-preset="fast"  title="Small fast response. The baseline: proves the tunnel is healthy.">/fast</button>
+      <button data-preset="slow"  title="Origin sleeps 20s, exceeding the edge timeout, which produces a 524.">/slow</button>
+      <button data-preset="hang"  title="Origin never responds at all: a 524 from a wedged worker.">/hang</button>
+      <button data-preset="bytes" title="1 MB body. Use this to push volume through the tunnel.">/bytes</button>
+      <button data-preset="drip"  title="Streams chunks slowly, exercising mid-body disconnects.">/drip</button>
+    </div>
+    <div class="row">
+      <div><label title="Number of independent QUIC connections. Each gets its own UDP socket, so kernel drops can be attributed to one connection.">conns</label><input id="conns" type="number" value="4"></div>
+      <div><label title="Concurrent requests per connection. These share one QUIC connection, so this is what exposes stream and flow-control effects.">workers</label><input id="workers" type="number" value="8"></div>
+      <div><label title="Global request rate cap across ALL workers. 0 means as fast as possible. Always set this against production.">rps</label><input id="rps" type="number" value="0"></div>
+    </div>
+    <div class="row">
+      <div><label title="How long the run lasts.">duration</label><input id="duration" value="30s"></div>
+      <div><label title="Per-request timeout. Set it BELOW the edge origin timeout to reproduce 'the client gave up first and no 524 appears anywhere'.">timeout</label><input id="timeout" value="30s"></div>
+    </div>
+    <div class="row">
+      <div><label title="Client-side QUIC keep-alive. 0 lets idle connections die; try 1s to prove keep-alives fix it.">client keepalive</label><input id="cKeepAlive" value="0s"></div>
+      <div><label title="Client-side QUIC max idle timeout. Lower it to force idle-timeout disconnects quickly.">client max idle</label><input id="cMaxIdle" value="30s"></div>
+    </div>
+    <label title="Sent on every request. Use for authenticated endpoints.">header (optional)</label>
+    <input id="header" placeholder="Authorization: Bearer ...">
+    <div class="row" style="margin-top:9px">
+      <div><label title="docker runs inside the compose network, which is required for the local edge. host runs from this machine, for public hostnames.">runner</label>
+        <select id="runner"><option value="docker">docker</option><option value="host">host</option></select>
+      </div>
+      <div><label title="Trust the demo's private CA, or the machine's system trust store. Use system CA for real public endpoints.">trust</label>
+        <select id="localCerts">
+          <option value="true">local CA (demo)</option>
+          <option value="false">system CA (public)</option>
+        </select>
+      </div>
+    </div>
+    <div class="btns">
+      <button class="primary" id="runBlast" title="Start the HTTP/3 load run with the settings above">&#9889; Blast</button>
+      <button id="runProbe" title="Safe single-request diagnostic: DNS, TLS, Alt-Svc, HTTP/3, plus a known-good control endpoint">&#9678; Probe</button>
+      <button id="readBodyBtn" class="tgl on" title="Drain response bodies. Turn off to abandon them mid-flight and force stream resets.">read body</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>&#9654; Scenarios</h2>
+    <div class="btns" style="margin-top:0">
+      <button data-scenario="baseline"  title="Proves the tunnel is healthy: thousands of requests per second, zero failures.">Baseline</button>
+      <button data-scenario="524"       title="Origin sleeps 20s, edge waits 10s. Produces 524 with cf_code 524 and elapsed_ms = the EDGE timeout.">Force 524</button>
+      <button data-scenario="invisible" title="Client timeout is shorter than the edge timeout: the client reports client_deadline and the edge logs NOTHING.">Invisible failure</button>
+      <button data-scenario="idle"      title="No keep-alives plus a slow origin: QUIC idle-timeout disconnects with packets_lost=0.">Idle disconnects</button>
+      <button data-scenario="keepalive" title="The same test with keep-alives enabled: zero connection drops.">Keepalive fix</button>
+      <button data-scenario="loss"      title="3% packet loss on the edge while pulling 1 MB bodies.">3% loss</button>
+      <button data-scenario="1033"      title="Kills the connector, then sends traffic: 502 with error code 1033, not a 524.">No connector</button>
+    </div>
+    <div class="hint">Each preset fills the form and starts the run. Hover a button to see what it proves.</div>
+  </div>
+
+</aside>
+
+<main>
+  <div id="flow" title="Live view of the request path. Links animate while traffic flows and turn red on failures.">
+    <div class="fnode" id="fClient" data-component="client" role="button" aria-label="Show client metrics" tabindex="0" title="Click for client metrics">
+      <div class="fname">client</div><div class="fsub">blast / browser</div>
+      <div class="fmetric"><span class="m">req <b id="cReq">0</b></span><span class="m err">fail <b id="cFail">0</b></span></div>
+    </div>
+    <div class="flink" id="lk1"><div class="flabel">HTTP/3 &middot; UDP 8443</div><div class="bar"></div><div class="fbadge" id="bd1"></div></div>
+    <div class="fnode" id="fEdge" data-component="edge" role="button" aria-label="Show edge metrics" tabindex="0" title="Click for edge metrics">
+      <div class="fname">edge</div><div class="fsub">cloudflare stand-in</div>
+      <div class="fmetric">
+        <span class="m">rps <b id="eRps">0</b></span>
+        <span class="m">avg <b id="eMs">0</b>ms</span>
+        <span class="m err">524 <b id="e524">0</b></span>
+        <span class="m err">5xx <b id="e502">0</b></span>
+      </div>
+    </div>
+    <div class="flink" id="lk2"><div class="flabel">QUIC tunnel &middot; 7844</div><div class="bar"></div><div class="fbadge" id="bd2"></div></div>
+    <div class="fnode" id="fConn" data-component="connector" role="button" aria-label="Show connector metrics" tabindex="0" title="Click for connector metrics">
+      <div class="fname">connector</div><div class="fsub">cloudflared stand-in</div>
+      <div class="fmetric"><span class="m" id="tunState">tunnel <b>&mdash;</b></span></div>
+    </div>
+    <div class="flink" id="lk3"><div class="flabel">HTTP/1.1 &middot; 8080</div><div class="bar"></div><div class="fbadge" id="bd3"></div></div>
+    <div class="fnode" id="fOrigin" data-component="origin" role="button" aria-label="Show origin metrics" tabindex="0" title="Click for origin metrics">
+      <div class="fname">origin</div><div class="fsub">your app</div>
+      <div class="fmetric"><span class="m">reached <b id="oRps">0</b>/s</span></div>
+    </div>
+  </div>
+  <div class="toolbar">
+    <span class="chip on" data-f="edge" title="Show or hide edge container logs">edge</span>
+    <span class="chip on" data-f="connector" title="Show or hide connector container logs">connector</span>
+    <span class="chip on" data-f="origin" title="Show or hide origin container logs">origin</span>
+    <span class="chip on" data-f="run" title="Show or hide blast/probe output">run</span>
+    <span class="chip on" data-f="ui" title="Show or hide commands this panel ran">ui</span>
+    <span class="chip on" id="prettyChip" title="Format the containers' JSON logs into level, message and key=value fields. Turn off for raw JSON.">pretty</span>
+    <input type="search" id="grep" placeholder="filter..." title="Only show lines containing this text">
+    <label class="lbl" title="Keep scrolling to the newest line"><input type="checkbox" id="follow" checked> follow</label>
+    <span class="spacer"></span>
+    <button class="ghost" id="clear" title="Clear the log pane">Clear</button>
+  </div>
+  <div class="logwrap">
+    <div id="log"><div class="empty">Waiting for output &mdash; press <b>Up</b> to start the stack, or pick a scenario.</div></div>
+    <button id="newBadge">&#8595; new output</button>
+  </div>
+</main>
+</div>
+
+<div id="scrim"></div>
+<aside id="help" aria-label="Help">
+  <header>
+    <div class="brand"><span class="dotlogo"></span>Help</div>
+    <div class="spacer"></div>
+    <button class="ghost" id="helpClose">&#10005; Close</button>
+  </header>
+  <div class="body">
+    <h3>What this is</h3>
+    <p>A local model of a Cloudflare-tunnel path, built on the same QUIC stack that
+      <code>cloudflared</code> uses. Traffic flows:</p>
+    <p><code>blast &rarr; edge (HTTP/3, owns the 524) = QUIC tunnel = connector &rarr; origin</code></p>
+
+    <h3>Reading the log</h3>
+    <table>
+      <tr><td>edge</td><td>The Cloudflare stand-in. Decides 524 / 1033 and logs every proxied request.</td></tr>
+      <tr><td>connector</td><td>The <code>cloudflared</code> stand-in. Dials <em>outbound</em> to the edge.</td></tr>
+      <tr><td>origin</td><td>Your app. Its latency is driven entirely by the URL path.</td></tr>
+      <tr><td>run</td><td>Output of the current blast or probe, including the final summary.</td></tr>
+      <tr><td>ui</td><td>The commands this panel executed on your behalf.</td></tr>
+    </table>
+
+    <h3>What to look for</h3>
+    <table>
+      <tr><td>524</td><td>The edge reached the origin but got no response in time.
+        <code>elapsed_ms</code> matches the <em>edge</em> timeout, not the origin's delay.</td></tr>
+      <tr><td>1033</td><td>No connector registered. The tunnel is down, not the origin.</td></tr>
+      <tr><td>client_deadline</td><td>The client gave up first. The edge logs nothing at all, so this
+        failure is invisible to Cloudflare-side dashboards.</td></tr>
+      <tr><td>quic_idle_timeout</td><td>The connection died from silence, not loss. Check
+        <code>packets_lost=0</code> in the detail: that is the proof.</td></tr>
+      <tr><td>sndbuf_err / rcvbuf_err</td><td>Kernel UDP counters in the header. Non-zero means datagrams
+        were dropped locally. This is the number to pull off an AKS node.</td></tr>
+      <tr><td>negotiated protocol</td><td>In the blast summary. Any <code>HTTP/2.0</code> line means the
+        server fell back and you are not testing HTTP/3 at all.</td></tr>
+    </table>
+
+    <h3>The three timeouts interact</h3>
+    <p>Who reports a failure depends on the ordering of the client timeout, the edge origin timeout,
+      and the origin's own latency.</p>
+    <table>
+      <tr><td>client &gt; edge</td><td>Clean 524. The classic case.</td></tr>
+      <tr><td>client &lt; edge</td><td>Client sees <code>client_deadline</code>, the edge logs nothing.
+        Very confusing in production.</td></tr>
+      <tr><td>no keep-alive</td><td>Idle connections die during long origin waits even with zero packet loss.</td></tr>
+    </table>
+
+    <h3>Testing a real tunnel</h3>
+    <p>Set <b>trust</b> to <em>system CA</em>, <b>runner</b> to <em>host</em>, and always set an
+      <b>rps</b> limit. Run <b>Probe</b> first: if it reports that UDP/443 is blocked on your network,
+      a blast result would be meaningless. Get authorisation before pointing sustained load at
+      someone else's production.</p>
+
+    <h3>Impairment caveat</h3>
+    <p><code>tc netem</code> attached to <code>root</code> on a container veth is not applied evenly
+      across TX queues, so request counts and medians vary a lot between runs. Trust the kernel
+      counters and the latency tail.</p>
+
+    <h3>Safety</h3>
+    <p>This panel shell-executes docker and tc on your machine. It binds to <code>127.0.0.1</code>
+      only, builds every command as an argument list rather than a shell string, and validates
+      inputs against allow-lists. Do not expose it on <code>0.0.0.0</code>.</p>
+  </div>
+</aside>
+
+<script>
+const $ = s => document.querySelector(s);
+const logEl = $('#log'), badge = $('#newBadge'), follow = $('#follow'), grep = $('#grep');
+let lines = [], hidden = new Set(), readBody = true, primed = false, pretty = true;
+let running = false, latestFlow = null, latestUDP = null, selectedComponent = 'edge', idleWaiters = [];
+
+const MAX_BUFFER = 6000, MAX_NODES = 2500;
+const srcKey = s => (s === 'blast' || s === 'probe') ? 'run' : s;
+
+function classify(line) {
+  if (/"level":"ERROR"|\[ FAIL \]|error code:|exceeds -max|VERDICT: (?!HTTP\/3 works)/.test(line)) return 'err';
+  if (/"level":"WARN"|\[ warn \]/.test(line)) return 'warn';
+  if (/\[  ok  \]|VERDICT: HTTP\/3 works|conn drops      0/.test(line)) return 'good';
+  return '';
+}
+const HOT_KEYS = new Set(['status','cf_code','elapsed_ms','err_kind','close_kind','ray','path','proto']);
+const SKIP_KEYS = new Set(['time','level','msg','role']);
+
+// Container logs are slog JSON. In pretty mode they become level + message +
+// key=value fields; anything unparseable falls through as plain text.
+function prettyBody(line) {
+  if (!pretty || line.length < 2 || line[0] !== '{') return null;
+  let o;
+  try { o = JSON.parse(line); } catch { return null; }
+  if (typeof o !== 'object' || o === null || o.msg === undefined) return null;
+
+  const frag = document.createDocumentFragment();
+  const lvl = document.createElement('span');
+  lvl.className = 'lvl lvl-' + (o.level || 'INFO');
+  lvl.textContent = o.level || 'INFO';
+  const msg = document.createElement('span');
+  msg.className = 'pmsg';
+  msg.textContent = o.msg;
+  frag.append(lvl, msg);
+
+  for (const k of Object.keys(o)) {
+    if (SKIP_KEYS.has(k)) continue;
+    const v = o[k];
+    const kv = document.createElement('span');
+    kv.className = 'kv' + (HOT_KEYS.has(k) ? ' hot' : '');
+    if ((k === 'status' && v >= 500) || k === 'cf_code' || k === 'err_kind' || k === 'close_kind') {
+      kv.className = 'kv bad';
+    }
+    const ks = document.createElement('span'); ks.className = 'k'; ks.textContent = k + '=';
+    const vs = document.createElement('span'); vs.className = 'v';
+    vs.textContent = typeof v === 'object' ? JSON.stringify(v) : String(v);
+    kv.append(ks, vs);
+    frag.appendChild(kv);
+  }
+  return frag;
+}
+
+function node(e) {
+  const d = document.createElement('div');
+  d.className = 'l';
+  const ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = e.ts || '';
+  const sr = document.createElement('span'); sr.className = 'src src-' + e.src; sr.textContent = e.src;
+  const ms = document.createElement('span');
+  ms.className = 'msg ' + classify(e.line);
+  if (/\b524\b|\b1033\b/.test(e.line)) ms.classList.add('hl');
+  const body = prettyBody(e.line);
+  if (body) ms.appendChild(body); else ms.textContent = e.line;
+  d.append(ts, sr, ms);
+  return d;
+}
+function matches(e) {
+  if (hidden.has(srcKey(e.src))) return false;
+  const g = grep.value.trim().toLowerCase();
+  return !g || e.line.toLowerCase().includes(g);
+}
+const atBottom = () => logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 48;
+const toBottom = () => { logEl.scrollTop = logEl.scrollHeight; badge.classList.remove('show'); };
+
+// The buffer is filled synchronously; only the DOM write is deferred to an
+// animation frame. rAF is paused in hidden tabs, so rendering there is skipped
+// entirely and rebuilt when the tab becomes visible again.
+let queue = [], scheduled = false, staleWhileHidden = false;
+function push(e) {
+  lines.push(e);
+  if (lines.length > MAX_BUFFER) lines.splice(0, lines.length - MAX_BUFFER);
+  if (!matches(e)) return;
+  if (document.hidden) { staleWhileHidden = true; return; }
+  queue.push(e);
+  if (queue.length > MAX_NODES) queue.splice(0, queue.length - MAX_NODES);
+  if (!scheduled) { scheduled = true; requestAnimationFrame(flush); }
+}
+function flush() {
+  scheduled = false;
+  if (!queue.length) return;
+  const wasBottom = atBottom();
+  const frag = document.createDocumentFragment();
+  for (const e of queue) frag.appendChild(node(e));
+  queue.length = 0;
+  if (!primed) { logEl.replaceChildren(); primed = true; }
+  logEl.appendChild(frag);
+  while (logEl.childElementCount > MAX_NODES) logEl.removeChild(logEl.firstElementChild);
+  if (follow.checked && wasBottom) toBottom();
+  else if (!wasBottom) badge.classList.add('show');
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && staleWhileHidden) { staleWhileHidden = false; rebuild(); }
+});
+function rebuild() {
+  const frag = document.createDocumentFragment();
+  lines.filter(matches).slice(-MAX_NODES).forEach(e => frag.appendChild(node(e)));
+  logEl.replaceChildren(frag);
+  primed = true;
+  queue.length = 0;
+  if (follow.checked) toBottom();
+}
+
+logEl.addEventListener('scroll', () => { if (atBottom()) badge.classList.remove('show'); });
+badge.onclick = toBottom;
+follow.onchange = () => { if (follow.checked) toBottom(); };
+grep.oninput = rebuild;
+$('#clear').onclick = () => { lines = []; logEl.replaceChildren(); primed = true; badge.classList.remove('show'); };
+document.querySelectorAll('.chip[data-f]').forEach(c => c.onclick = () => {
+  c.classList.toggle('on');
+  hidden.has(c.dataset.f) ? hidden.delete(c.dataset.f) : hidden.add(c.dataset.f);
+  rebuild();
+});
+
+$('#prettyChip').onclick = e => {
+  pretty = !pretty;
+  e.target.classList.toggle('on', pretty);
+  rebuild();
+};
+
+$('#helpBtn').onclick = () => { $('#help').classList.add('open'); $('#scrim').classList.add('open'); };
+const closeHelp = () => { $('#help').classList.remove('open'); $('#scrim').classList.remove('open'); };
+$('#helpClose').onclick = closeHelp;
+$('#scrim').onclick = closeHelp;
+addEventListener('keydown', e => { if (e.key === 'Escape') closeHelp(); });
+
+const es = new EventSource('/api/events');
+es.onmessage = ev => {
+  const m = JSON.parse(ev.data);
+  if (m.t === 'log') push(m);
+  else if (m.t === 'status') {
+    setRunning(m.running);
+    $('#dot').classList.toggle('run', m.running);
+    $('#runName').textContent = m.running ? m.name : 'idle';
+    $('#stop').disabled = !m.running;
+  } else if (m.t === 'flow') {
+    latestFlow = m;
+    renderFlow(m);
+    renderComponentMetrics();
+  } else if (m.t === 'udp') {
+    latestUDP = m;
+    $('#stats').innerHTML =
+      '<span class="stat" title="UDP datagrams in and out of the edge container in the last 3s">udp in <b>' +
+        m.in + '</b> out <b>' + m.out + '</b></span>' +
+      '<span class="stat ' + (m.rcvbuf ? 'bad' : '') +
+        '" title="Datagrams dropped because the RECEIVE buffer was full">rcvbuf_err <b>' + m.rcvbuf + '</b></span>' +
+      '<span class="stat ' + (m.sndbuf ? 'bad' : '') +
+        '" title="Datagrams dropped because the SEND buffer was full. Total since container start: ' +
+        m.sndbufTotal + '">sndbuf_err <b>' + m.sndbuf + '</b></span>';
+  }
+};
+es.onerror = () => push({src:'ui', ts:'', line:'event stream disconnected - is `quicshot ui` still running?'});
+
+function setRunning(value) {
+  running = !!value;
+  if (!running) {
+    const waiters = idleWaiters.splice(0);
+    waiters.forEach(resolve => resolve());
+  }
+}
+
+function waitForIdle(ms = 15000) {
+  if (!running) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms);
+    idleWaiters.push(() => { clearTimeout(timer); resolve(); });
+  });
+}
+
+function setLink(el, state, badge) {
+  el.classList.toggle('active', state === 'active');
+  el.classList.toggle('err', state === 'err');
+  el.classList.toggle('dead', state === 'dead');
+  el.querySelector('.fbadge').textContent = badge || '';
+}
+
+// Activity is held for a few seconds so slow scenarios (one request every 20s)
+// still show a live link rather than flickering off between requests.
+let lastBusy = 0, lastFail = 0;
+const HOLD_MS = 4000;
+
+function renderFlow(m) {
+  const now = Date.now();
+  if (m.edge.rps > 0) lastBusy = now;
+  if (m.edge.s524 + m.edge.s502 > 0) lastFail = now;
+  const busy = now - lastBusy < HOLD_MS, failing = now - lastFail < HOLD_MS;
+
+  $('#cReq').textContent  = m.client.req;
+  $('#cFail').textContent = m.client.fail;
+  $('#eRps').textContent  = m.edge.rps;
+  $('#eMs').textContent   = m.edge.avgMs;
+  $('#e524').textContent  = m.edge.t524;
+  $('#e502').textContent  = m.edge.t502;
+  $('#oRps').textContent  = m.origin.rps;
+
+  const tun = $('#tunState');
+  if (!m.tunnel.known) {
+    tun.innerHTML = 'tunnel <b style="color:var(--faint)">unknown</b>';
+  } else if (m.tunnel.up) {
+    tun.innerHTML = 'tunnel <b style="color:var(--ok)">up</b>' +
+                    (m.tunnel.n > 0 ? ' &times;' + m.tunnel.n : '');
+  } else {
+    tun.innerHTML = 'tunnel <b style="color:var(--err)">down</b>';
+  }
+
+  const tunnelDown = m.tunnel.known && !m.tunnel.up;
+  $('#fClient').className  = 'fnode' + (m.client.fail > 0 ? ' bad' : busy ? ' hot' : '');
+  $('#fEdge').className    = 'fnode' + (failing ? ' bad' : busy ? ' hot' : '');
+  $('#fConn').className    = 'fnode' + (tunnelDown ? ' down' : busy ? ' hot' : '');
+  $('#fOrigin').className  = 'fnode' + (m.origin.rps > 0 ? ' hot' : '');
+  markSelectedComponent();
+
+  // The impairment badge is drawn on the hop it actually affects.
+  const imp = m.impair || '';
+  const on = w => imp.startsWith(w) ? imp : '';
+  setLink($('#lk1'), busy ? (failing ? 'err' : 'active') : '', on('blast') || on('edge'));
+  setLink($('#lk2'), tunnelDown ? 'dead' : busy ? (failing ? 'err' : 'active') : '',
+          on('connector') || on('edge'));
+  setLink($('#lk3'), m.origin.rps > 0 || (busy && !tunnelDown) ? (failing ? 'err' : 'active') : '', on('origin'));
+}
+
+function metricRow(label, value) {
+  return '<div class="metricLine"><span>' + label + '</span><b>' + value + '</b></div>';
+}
+
+function markSelectedComponent() {
+  document.querySelectorAll('[data-component]').forEach(n =>
+    n.classList.toggle('sel', n.dataset.component === selectedComponent));
+}
+
+function connectorDistribution(connectorReq) {
+  const entries = Object.entries(connectorReq || {}).sort((a, b) => Number(a[0]) - Number(b[0]));
+  if (!entries.length) return 'no requests yet';
+  return entries.map(([id, n]) => '#' + id + ':' + n).join('  ');
+}
+
+function renderComponentMetrics() {
+  const box = $('#componentMetrics');
+  if (!latestFlow) {
+    box.textContent = 'Waiting for flow data.';
+    markSelectedComponent();
+    return;
+  }
+  const f = latestFlow;
+  const udp = latestUDP || {in:0, out:0, rcvbuf:0, sndbuf:0, rcvbufTotal:0, sndbufTotal:0};
+  const rowsByComponent = {
+    client: [
+      ['requests', f.client.req],
+      ['failures', f.client.fail],
+      ['successes', Math.max(0, f.client.req - f.client.fail)],
+    ],
+    edge: [
+      ['requests total', f.edge.total],
+      ['524 total', f.edge.t524],
+      ['5xx total', f.edge.t502],
+      ['current rps', f.edge.rps],
+      ['avg latency ms', f.edge.avgMs],
+      ['udp in/out', udp.in + ' / ' + udp.out],
+      ['rcvbuf/sndbuf err', udp.rcvbuf + ' / ' + udp.sndbuf],
+    ],
+    connector: [
+      ['registered replicas', f.tunnel.n],
+      ['tunnel state', f.tunnel.known ? (f.tunnel.up ? 'up' : 'down') : 'unknown'],
+      ['request spread', connectorDistribution(f.tunnel.connectorReq)],
+      ['impairment', f.impair || 'none'],
+    ],
+    origin: [
+      ['reached this second', f.origin.rps],
+      ['edge requests total', f.edge.total],
+      ['origin timeouts', f.edge.t524],
+    ],
+  };
+  box.innerHTML = (rowsByComponent[selectedComponent] || []).map(([k, v]) => metricRow(k, v)).join('');
+  markSelectedComponent();
+}
+
+document.querySelectorAll('[data-component]').forEach(n => {
+  n.onclick = () => { selectedComponent = n.dataset.component; renderComponentMetrics(); };
+  n.onkeydown = e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      selectedComponent = n.dataset.component;
+      renderComponentMetrics();
+    }
+  };
+});
+
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body || {})});
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({error:'request failed'}));
+    push({src:'ui', ts:new Date().toTimeString().slice(0,8), line:'error: ' + j.error});
+    return false;
+  }
+  if (r.status === 202) setRunning(true);
+  return true;
+}
+
+function ensureIdle(action) {
+  if (!running) return true;
+  push({src:'ui', ts:new Date().toTimeString().slice(0,8), line:'cannot start ' + action + ': another command is still running'});
+  return false;
+}
+
+async function beginNewTest(promptText) {
+  if (promptText && !confirm(promptText)) return false;
+  lines = [];
+  queue.length = 0;
+  primed = true;
+  logEl.replaceChildren();
+  badge.classList.remove('show');
+  latestFlow = null;
+  latestUDP = null;
+  $('#componentMetrics').textContent = 'Waiting for flow data.';
+  await post('/api/reset');
+  return true;
+}
+
+document.querySelectorAll('[data-stack]').forEach(b => b.onclick = () => {
+  if (!ensureIdle(b.dataset.stack)) return;
+  post('/api/stack', {
+    action: b.dataset.stack, originTimeout: $('#originTimeout').value,
+    maxIdle: $('#maxIdle').value, keepAlive: $('#keepAlive').value,
+    connectors: +$('#connectors').value,
+  });
+});
+document.querySelectorAll('[data-impair]').forEach(b => b.onclick = () => {
+  if (!ensureIdle('impairment')) return;
+  post('/api/impair', {
+    service: $('#impSvc').value,
+    mode: b.dataset.impair === 'clear' ? 'clear' : $('#impMode').value,
+    a: $('#impA').value, b: $('#impB').value,
+  });
+});
+$('#stop').onclick = () => post('/api/stop');
+$('#readBodyBtn').onclick = e => { readBody = !readBody; e.target.classList.toggle('on', readBody); };
+
+const presets = {
+  fast:'https://edge:8443/fast', slow:'https://edge:8443/slow?ms=20000',
+  hang:'https://edge:8443/hang', bytes:'https://edge:8443/bytes?n=1048576',
+  drip:'https://edge:8443/drip?ms=200&chunks=20',
+};
+document.querySelectorAll('[data-preset]').forEach(b =>
+  b.onclick = () => $('#url').value = presets[b.dataset.preset]);
+
+const runBody = tool => ({
+  tool, runner:$('#runner').value, url:$('#url').value,
+  conns:+$('#conns').value, workers:+$('#workers').value,
+  duration:$('#duration').value, timeout:$('#timeout').value,
+  keepAlive:$('#cKeepAlive').value, maxIdle:$('#cMaxIdle').value,
+  rps:+$('#rps').value, readBody, localCerts:$('#localCerts').value === 'true',
+  headers: $('#header').value ? [$('#header').value] : [],
+});
+$('#runBlast').onclick = async () => {
+  if (!ensureIdle('blast')) return;
+  if (!await beginNewTest('Start a new blast test and reset counters?')) return;
+  post('/api/run', runBody('blast'));
+};
+$('#runProbe').onclick = async () => {
+  if (!ensureIdle('probe')) return;
+  if (!await beginNewTest('Start a new probe test and reset counters?')) return;
+  post('/api/run', runBody('probe'));
+};
+
+const scenarios = {
+  baseline:  {url:presets.fast,  conns:4, workers:16, duration:'30s', timeout:'30s'},
+  '524':     {url:presets.slow,  conns:2, workers:4,  duration:'45s', timeout:'40s'},
+  invisible: {url:presets.slow,  conns:1, workers:2,  duration:'15s', timeout:'3s'},
+  idle:      {url:'https://edge:8443/slow?ms=9000', conns:1, workers:1, duration:'30s',
+              cKeepAlive:'0s', cMaxIdle:'3s', timeout:'30s'},
+  keepalive: {url:'https://edge:8443/slow?ms=9000', conns:1, workers:1, duration:'30s',
+              cKeepAlive:'1s', cMaxIdle:'3s', timeout:'30s'},
+  loss:      {url:presets.bytes, conns:4, workers:16, duration:'45s', timeout:'30s',
+              impair:{mode:'loss', a:'3%'}},
+  '1033':    {url:presets.fast,  conns:1, workers:1,  duration:'10s', timeout:'10s',
+              killConnector:true},
+};
+document.querySelectorAll('[data-scenario]').forEach(b => b.onclick = async () => {
+  if (!ensureIdle('scenario')) return;
+  if (!await beginNewTest('Start a new scenario and reset counters/flow tracking?')) return;
+  const s = scenarios[b.dataset.scenario];
+  for (const k in s) { const el = $('#' + k); if (el) el.value = s[k]; }
+  if (s.impair) {
+    $('#impMode').value = s.impair.mode; $('#impA').value = s.impair.a;
+    if (await post('/api/impair', {service:'edge', mode:s.impair.mode, a:s.impair.a, b:''})) await waitForIdle();
+  }
+  if (s.killConnector) {
+    if (await post('/api/stack', {action:'stop-connector'})) await waitForIdle();
+    push({src:'ui', ts:new Date().toTimeString().slice(0,8), line:'No connector scenario leaves the connector stopped. Use Restore 1 or Scale to bring it back.'});
+  }
+  post('/api/run', runBody('blast'));
+});
+</script>
+</body>
+</html>
