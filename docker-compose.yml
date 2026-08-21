@@ -10,7 +10,7 @@ services:
   # One-shot: mint the CA + edge certificate into the shared volume.
   certs:
     <<: *image
-    command: ["gencerts", "-dir", "/certs", "-hosts", "edge,localhost,127.0.0.1"]
+    command: ["gencerts", "-dir", "/certs", "-hosts", "edge,localhost,127.0.0.1,::1"]
     volumes:
       - certs:/certs
 
@@ -35,6 +35,9 @@ services:
       - -origin-timeout=${EDGE_ORIGIN_TIMEOUT:-10s}
       - -max-idle-timeout=${EDGE_MAX_IDLE:-30s}
       - -keepalive=${EDGE_KEEPALIVE:-0s}
+      - -tunnel-max-idle-timeout=${EDGE_TUNNEL_MAX_IDLE:-30s}
+      - -tunnel-keepalive=${EDGE_TUNNEL_KEEPALIVE:-5s}
+      - -tunnel-lb=${EDGE_TUNNEL_LB:-rr}
       - -udp-recv-buffer=${EDGE_UDP_RECV_BUFFER:-0}
       - -qlog-dir=${EDGE_QLOG_DIR:-}
     depends_on:
