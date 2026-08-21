@@ -4,6 +4,7 @@
 package blast
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -53,7 +54,7 @@ type event struct {
 type recorder struct {
 	mu        sync.Mutex
 	enc       *json.Encoder
-	latencies []time.Duration
+	lat       *latencyHist
 	status    map[int]int
 	kinds     map[string]int
 	protos    map[string]int // negotiated application protocol per response
@@ -62,6 +63,9 @@ type recorder struct {
 	requests  atomic.Int64
 	failures  atomic.Int64
 	abandoned atomic.Int64 // in flight when the run ended: neither success nor failure
+	omitted   atomic.Int64 // open-loop ticks dropped because max-inflight was full
+	offered   atomic.Int64
+	bytes     atomic.Int64
 }
 
 // headerList collects repeated -header flags.
@@ -72,37 +76,63 @@ func (h *headerList) Set(v string) error { *h = append(*h, v); return nil }
 
 // reqSpec is the fixed shape of every request in a run.
 type reqSpec struct {
-	url      string
-	method   string
-	hostHdr  string
-	headers  headerList
-	timeout  time.Duration
-	readBody bool
+	url         string
+	urls        []string
+	n           atomic.Uint64
+	method      string
+	hostHdr     string
+	headers     headerList
+	timeout     time.Duration
+	readBody    bool
+	body        []byte
+	contentType string
+}
+
+func (s *reqSpec) nextURL() string {
+	if len(s.urls) > 0 {
+		if len(s.urls) == 1 {
+			return s.urls[0]
+		}
+		i := s.n.Add(1) - 1
+		return s.urls[i%uint64(len(s.urls))]
+	}
+	return s.url
 }
 
 type config struct {
-	target     string
-	conns      int
-	workers    int
-	duration   time.Duration
-	requests   int64
-	timeout    time.Duration
-	maxIdle    time.Duration
-	keepAlive  time.Duration
-	recvBuf    int
-	certDir    string
-	serverName string
-	insecure   bool
-	logPath    string
-	statsEvery time.Duration
-	readBody   bool
-	method     string
-	hostHdr    string
-	headers    headerList
-	rps        float64
-	maxFailPct float64
-	maxDrops   int
-	qlogDir    string
+	target      string
+	urls        string
+	urlsFile    string
+	targets     []string
+	conns       int
+	workers     int
+	duration    time.Duration
+	warmup      time.Duration
+	requests    int64
+	timeout     time.Duration
+	maxIdle     time.Duration
+	keepAlive   time.Duration
+	recvBuf     int
+	certDir     string
+	serverName  string
+	insecure    bool
+	logPath     string
+	statsEvery  time.Duration
+	readBody    bool
+	method      string
+	hostHdr     string
+	headers     headerList
+	bodyStr     string
+	bodyFile    string
+	body        []byte
+	contentType string
+	rps         float64
+	mode        string
+	maxInflight int
+	probe0RTT   bool
+	maxFailPct  float64
+	maxDrops    int
+	qlogDir     string
 }
 
 var cfErrorRE = regexp.MustCompile(`error code: (\d+)`)
@@ -110,6 +140,7 @@ var cfErrorRE = regexp.MustCompile(`error code: (\d+)`)
 func newRecorder(w io.Writer) *recorder {
 	return &recorder{
 		enc:     json.NewEncoder(w),
+		lat:     newLatencyHist(200000),
 		status:  map[int]int{},
 		kinds:   map[string]int{},
 		protos:  map[string]int{},
@@ -126,10 +157,28 @@ func (r *recorder) emit(e event) {
 
 func (r *recorder) success(e event, d time.Duration) {
 	r.requests.Add(1)
+	r.bytes.Add(e.Bytes)
 	r.mu.Lock()
-	r.latencies = append(r.latencies, d)
+	r.lat.add(d)
 	r.status[e.Status]++
 	r.mu.Unlock()
+}
+
+func (r *recorder) resetRequestStats() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lat = newLatencyHist(200000)
+	r.status = map[int]int{}
+	r.kinds = map[string]int{}
+	r.protos = map[string]int{}
+	r.cfCodes = map[int]int{}
+	r.connDrops = 0
+	r.requests.Store(0)
+	r.failures.Store(0)
+	r.abandoned.Store(0)
+	r.omitted.Store(0)
+	r.offered.Store(0)
+	r.bytes.Store(0)
 }
 
 func (r *recorder) failure(e event) {
@@ -148,9 +197,12 @@ func parseConfig(args []string) (config, error) {
 	cfg := config{}
 	fs := flag.NewFlagSet("blast", flag.ExitOnError)
 	fs.StringVar(&cfg.target, "url", "https://edge:8443/fast", "target URL (must be reachable over HTTP/3)")
+	fs.StringVar(&cfg.urls, "urls", "", "comma-separated extra URLs, mixed round-robin with -url")
+	fs.StringVar(&cfg.urlsFile, "urls-file", "", "file of extra URLs, one per line")
 	fs.IntVar(&cfg.conns, "conns", 4, "number of independent QUIC connections")
-	fs.IntVar(&cfg.workers, "workers", 8, "concurrent requests per QUIC connection")
-	fs.DurationVar(&cfg.duration, "duration", 30*time.Second, "how long to run (0 = until -requests is met)")
+	fs.IntVar(&cfg.workers, "workers", 8, "concurrent requests per QUIC connection (closed-loop)")
+	fs.DurationVar(&cfg.duration, "duration", 30*time.Second, "measured run length after -warmup (0 = until -requests is met)")
+	fs.DurationVar(&cfg.warmup, "warmup", 0, "traffic sent before measurement starts; discarded from the summary")
 	fs.Int64Var(&cfg.requests, "requests", 0, "stop after this many requests (0 = unlimited)")
 	fs.DurationVar(&cfg.timeout, "timeout", 30*time.Second, "per-request timeout")
 	fs.DurationVar(&cfg.maxIdle, "max-idle-timeout", 30*time.Second, "QUIC max idle timeout")
@@ -165,7 +217,13 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.method, "method", http.MethodGet, "HTTP method")
 	fs.StringVar(&cfg.hostHdr, "host", "", "override the Host header")
 	fs.Var(&cfg.headers, "header", "extra request header 'Key: Value' (repeatable)")
-	fs.Float64Var(&cfg.rps, "rps", 0, "client-side rate limit across all workers (0 = unlimited)")
+	fs.StringVar(&cfg.bodyStr, "body", "", "request body string (for POST/PUT)")
+	fs.StringVar(&cfg.bodyFile, "body-file", "", "read request body from this file")
+	fs.StringVar(&cfg.contentType, "content-type", "", "Content-Type for -body / -body-file")
+	fs.Float64Var(&cfg.rps, "rps", 0, "offered request rate across all workers (0 = unlimited; required for -mode=open)")
+	fs.StringVar(&cfg.mode, "mode", "closed", "load mode: closed (workers wait for responses) or open (token bucket, independent of latency)")
+	fs.IntVar(&cfg.maxInflight, "max-inflight", 0, "cap on in-flight requests in open mode (0 = conns*workers*8, max 4096)")
+	fs.BoolVar(&cfg.probe0RTT, "probe-0rtt", false, "dial twice before the run and record whether the second handshake used 0-RTT")
 	fs.Float64Var(&cfg.maxFailPct, "max-failure-pct", -1, "exit non-zero if the failure rate exceeds this percentage")
 	fs.IntVar(&cfg.maxDrops, "max-conn-drops", -1, "exit non-zero if QUIC connection drops exceed this count")
 	fs.StringVar(&cfg.qlogDir, "qlog-dir", "", "write QUIC qlog traces to this directory (empty disables)")
@@ -183,6 +241,12 @@ func Main(args []string) error {
 
 	if _, err := url.Parse(cfg.target); err != nil {
 		return fmt.Errorf("bad -url: %w", err)
+	}
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	if err := cfg.loadPayload(); err != nil {
+		return err
 	}
 
 	out, closeOut, err := outputWriter(cfg.logPath)
@@ -203,29 +267,114 @@ func Main(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if cfg.duration > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cfg.duration)
-		defer cancel()
-	}
 
 	transports := makeTransports(cfg, tlsConf, quicConf, rec)
 	defer closeTransports(transports)
 
+	if cfg.probe0RTT {
+		if err := probe0RTT(ctx, cfg, tlsConf, quicConf, rec); err != nil {
+			rec.emit(event{Event: "0rtt_probe", Kind: "error", Detail: err.Error()})
+		}
+	}
+
+	spec := cfg.spec()
 	go progress(ctx, rec, cfg.statsEvery)
 
-	spec := &reqSpec{
-		url: cfg.target, method: cfg.method, hostHdr: cfg.hostHdr, headers: cfg.headers,
-		timeout: cfg.timeout, readBody: cfg.readBody,
+	if cfg.warmup > 0 {
+		wctx, cancel := context.WithTimeout(ctx, cfg.warmup)
+		runLoad(wctx, cfg, transports, rec, spec)
+		cancel()
+		rec.resetRequestStats()
 	}
-	pace, stopPace := requestPacer(cfg.rps)
-	defer stopPace()
 
+	runCtx := ctx
+	if cfg.duration > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, cfg.duration)
+		defer cancel()
+	}
 	start := time.Now()
-	runWorkers(workerRun{ctx: ctx, cfg: cfg, transports: transports, pace: pace, rec: rec, spec: spec})
+	runLoad(runCtx, cfg, transports, rec, spec)
 
 	rec.summary(os.Stderr, time.Since(start))
 	return rec.verdict(cfg.maxFailPct, cfg.maxDrops)
+}
+
+func (c config) validate() error {
+	if c.mode != "closed" && c.mode != "open" {
+		return fmt.Errorf("-mode must be closed or open")
+	}
+	if c.mode == "open" && c.rps <= 0 {
+		return fmt.Errorf("-mode=open requires -rps > 0 so offered load does not depend on latency")
+	}
+	if c.conns < 1 || c.workers < 1 {
+		return fmt.Errorf("-conns and -workers must be >= 1")
+	}
+	return nil
+}
+
+func (c *config) loadPayload() error {
+	if c.bodyFile != "" {
+		b, err := os.ReadFile(c.bodyFile)
+		if err != nil {
+			return fmt.Errorf("read -body-file: %w", err)
+		}
+		c.body = b
+	} else if c.bodyStr != "" {
+		c.body = []byte(c.bodyStr)
+	}
+
+	c.targets = []string{c.target}
+	if c.urls != "" {
+		for _, u := range strings.Split(c.urls, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				c.targets = append(c.targets, u)
+			}
+		}
+	}
+	if c.urlsFile != "" {
+		raw, err := os.ReadFile(c.urlsFile)
+		if err != nil {
+			return fmt.Errorf("read -urls-file: %w", err)
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			c.targets = append(c.targets, line)
+		}
+	}
+	return nil
+}
+
+func (c config) spec() *reqSpec {
+	return &reqSpec{
+		url: c.target, urls: c.targets, method: c.method, hostHdr: c.hostHdr,
+		headers: c.headers, timeout: c.timeout, readBody: c.readBody,
+		body: c.body, contentType: c.contentType,
+	}
+}
+
+func (c config) inflight() int {
+	if c.maxInflight > 0 {
+		if c.maxInflight > 4096 {
+			return 4096
+		}
+		return c.maxInflight
+	}
+	n := c.conns * c.workers
+	if c.mode == "open" {
+		n *= 8
+	}
+	if n < 1 {
+		return 1
+	}
+	if n > 4096 {
+		return 4096
+	}
+	return n
 }
 
 func outputWriter(path string) (io.Writer, func() error, error) {
@@ -245,6 +394,7 @@ func tlsConfig(cfg config) (*tls.Config, error) {
 		InsecureSkipVerify: cfg.insecure,
 		NextProtos:         []string{http3.NextProtoH3},
 		MinVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
 	if cfg.certDir == "" || cfg.insecure {
 		return tlsConf, nil
@@ -275,7 +425,7 @@ func makeTransports(cfg config, tlsConf *tls.Config, quicConf *quic.Config, rec 
 			Dial: func(dctx context.Context, addr string, tc *tls.Config, qc *quic.Config) (*quic.Conn, error) {
 				// Each connection gets its own UDP socket so per-socket buffer
 				// limits and kernel drops can be attributed to one connection.
-				udp, err := udpsock.Listen("0.0.0.0:0", cfg.recvBuf, 0)
+				udp, err := udpsock.Listen(":0", cfg.recvBuf, 0)
 				if err != nil {
 					return nil, err
 				}
@@ -328,60 +478,6 @@ func closeTransports(transports []*http3.Transport) {
 	}
 }
 
-func requestPacer(rps float64) (<-chan time.Time, func()) {
-	if rps <= 0 {
-		return nil, func() { /* no ticker was created */ }
-	}
-	t := time.NewTicker(time.Duration(float64(time.Second) / rps))
-	return t.C, t.Stop
-}
-
-type workerRun struct {
-	ctx        context.Context
-	cfg        config
-	transports []*http3.Transport
-	pace       <-chan time.Time
-	rec        *recorder
-	spec       *reqSpec
-}
-
-func runWorkers(run workerRun) {
-	var wg sync.WaitGroup
-	for c := 0; c < run.cfg.conns; c++ {
-		for w := 0; w < run.cfg.workers; w++ {
-			wg.Add(1)
-			go runWorker(&wg, run, c, w)
-		}
-	}
-	wg.Wait()
-}
-
-func runWorker(wg *sync.WaitGroup, run workerRun, connIdx, workerIdx int) {
-	defer wg.Done()
-	client := &http.Client{Transport: run.transports[connIdx]}
-	for run.ctx.Err() == nil {
-		if run.cfg.requests > 0 && run.rec.requests.Load() >= run.cfg.requests {
-			return
-		}
-		if !waitForPace(run.ctx, run.pace) {
-			return
-		}
-		doRequest(run.ctx, run.rec, client, run.spec, connIdx, workerIdx)
-	}
-}
-
-func waitForPace(ctx context.Context, pace <-chan time.Time) bool {
-	if pace == nil {
-		return true
-	}
-	select {
-	case <-pace:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
 // verdict turns the run into a pass/fail signal so this can gate a pipeline.
 func (r *recorder) verdict(maxFailPct float64, maxDrops int) error {
 	total := r.requests.Load()
@@ -409,83 +505,129 @@ func doRequest(ctx context.Context, rec *recorder, client *http.Client, spec *re
 	reqCtx, cancel := context.WithTimeout(ctx, spec.timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, spec.method, spec.url, nil)
+	target := spec.nextURL()
+	req, err := spec.newRequest(reqCtx, target)
 	if err != nil {
 		return
 	}
-	for _, h := range spec.headers {
-		if k, v, ok := strings.Cut(h, ":"); ok {
-			req.Header.Add(strings.TrimSpace(k), strings.TrimSpace(v))
-		}
-	}
-	if spec.hostHdr != "" {
-		req.Host = spec.hostHdr
-	}
-	url := spec.url
-	readBody := spec.readBody
 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		if ctx.Err() != nil { // shutting down, not a real failure
-			rec.abandoned.Add(1)
-			return
-		}
-		kind, detail := quicerr.Classify(err)
-		rec.failure(event{
-			Event: "request_failed", Conn: connIdx, Worker: workerIdx, URL: url,
-			Kind: string(kind), Detail: detail, LatencyMs: time.Since(start).Milliseconds(),
-		})
+		recordDialError(ctx, rec, err, connIdx, workerIdx, target, start)
 		return
 	}
 
 	rec.recordProto(resp.Proto)
-
-	// Cloudflare puts the real reason in the body ("error code: 524"), not a header,
-	// so 5xx bodies are read even when -read-body is off.
-	var cfCode int
-	var n int64
-	if resp.StatusCode >= 500 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		n = int64(len(snippet))
-		if m := cfErrorRE.FindSubmatch(snippet); m != nil {
-			cfCode, _ = strconv.Atoi(string(m[1]))
-		}
-		io.Copy(io.Discard, resp.Body)
-	} else if readBody {
-		n, err = io.Copy(io.Discard, resp.Body)
-	}
+	n, cfCode, err := drainResponse(resp, spec.readBody)
 	resp.Body.Close()
 	elapsed := time.Since(start)
 
+	recordHTTPResult(ctx, rec, httpResult{
+		err: err, cfCode: cfCode, elapsed: elapsed, ray: resp.Header.Get("cf-ray"),
+		event: event{Conn: connIdx, Worker: workerIdx, URL: target,
+			Status: resp.StatusCode, Bytes: n, LatencyMs: elapsed.Milliseconds()},
+	})
+}
+
+func (s *reqSpec) newRequest(ctx context.Context, target string) (*http.Request, error) {
+	var body io.Reader
+	if len(s.body) > 0 {
+		body = bytes.NewReader(s.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, s.method, target, body)
 	if err != nil {
+		return nil, err
+	}
+	s.applyHeaders(req)
+	return req, nil
+}
+
+func (s *reqSpec) applyHeaders(req *http.Request) {
+	if len(s.body) > 0 {
+		req.ContentLength = int64(len(s.body))
+		if s.contentType != "" {
+			req.Header.Set("Content-Type", s.contentType)
+		}
+	}
+	for _, h := range s.headers {
+		if k, v, ok := strings.Cut(h, ":"); ok {
+			req.Header.Add(strings.TrimSpace(k), strings.TrimSpace(v))
+		}
+	}
+	if s.hostHdr != "" {
+		req.Host = s.hostHdr
+	}
+}
+
+func drainResponse(resp *http.Response, readBody bool) (n int64, cfCode int, err error) {
+	// Cloudflare puts the real reason in the body ("error code: 524"), not a header,
+	// so 5xx bodies are read even when -read-body is off.
+	if resp.StatusCode >= 500 {
+		return drainErrorBody(resp)
+	}
+	if readBody {
+		n, err = io.Copy(io.Discard, resp.Body)
+	}
+	return n, 0, err
+}
+
+func drainErrorBody(resp *http.Response) (int64, int, error) {
+	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	io.Copy(io.Discard, resp.Body)
+	cfCode := 0
+	if m := cfErrorRE.FindSubmatch(snippet); m != nil {
+		cfCode, _ = strconv.Atoi(string(m[1]))
+	}
+	return int64(len(snippet)), cfCode, nil
+}
+
+func recordDialError(ctx context.Context, rec *recorder, err error, connIdx, workerIdx int, url string, start time.Time) {
+	if ctx.Err() != nil { // shutting down, not a real failure
+		rec.abandoned.Add(1)
+		return
+	}
+	kind, detail := quicerr.Classify(err)
+	rec.failure(event{
+		Event: "request_failed", Conn: connIdx, Worker: workerIdx, URL: url,
+		Kind: string(kind), Detail: detail, LatencyMs: time.Since(start).Milliseconds(),
+	})
+}
+
+type httpResult struct {
+	err     error
+	cfCode  int
+	elapsed time.Duration
+	ray     string
+	event   event
+}
+
+func recordHTTPResult(ctx context.Context, rec *recorder, res httpResult) {
+	e := res.event
+	if res.err != nil {
 		if ctx.Err() != nil { // run ended mid-body; not a real truncation
 			rec.abandoned.Add(1)
 			return
 		}
-		kind, detail := quicerr.Classify(err)
-		// Header arrived, body did not: the disconnect happened mid-response.
-		rec.failure(event{
-			Event: "body_truncated", Conn: connIdx, Worker: workerIdx, URL: url,
-			Status: resp.StatusCode, Bytes: n, Kind: string(kind), Detail: detail,
-			LatencyMs: elapsed.Milliseconds(),
-		})
+		kind, detail := quicerr.Classify(res.err)
+		e.Event = "body_truncated"
+		e.Kind = string(kind)
+		e.Detail = detail
+		rec.failure(e)
 		return
 	}
-
-	e := event{Event: "request", Conn: connIdx, Worker: workerIdx, URL: url,
-		Status: resp.StatusCode, Bytes: n, LatencyMs: elapsed.Milliseconds()}
-	if resp.StatusCode >= 500 {
+	if e.Status >= 500 {
 		e.Event = "request_5xx"
-		e.Kind = fmt.Sprintf("http_%d", resp.StatusCode)
-		e.Detail = fmt.Sprintf("cf_error_code=%d cf_ray=%s", cfCode, resp.Header.Get("cf-ray"))
-		if cfCode != 0 {
-			rec.recordCFCode(cfCode)
+		e.Kind = fmt.Sprintf("http_%d", e.Status)
+		e.Detail = fmt.Sprintf("cf_error_code=%d cf_ray=%s", res.cfCode, res.ray)
+		if res.cfCode != 0 {
+			rec.recordCFCode(res.cfCode)
 		}
 		rec.failure(e)
 		return
 	}
-	rec.success(e, elapsed)
+	e.Event = "request"
+	rec.success(e, res.elapsed)
 }
 
 func (r *recorder) recordProto(proto string) {
@@ -514,8 +656,8 @@ func progress(ctx context.Context, rec *recorder, every time.Duration) {
 			return
 		case <-t.C:
 			req, fail := rec.requests.Load(), rec.failures.Load()
-			line := fmt.Sprintf("[blast] +%d req  +%d fail  total=%d fail=%d",
-				req-prevReq, fail-prevFail, req, fail)
+			line := fmt.Sprintf("[blast] +%d req  +%d fail  total=%d fail=%d omit=%d",
+				req-prevReq, fail-prevFail, req, fail, rec.omitted.Load())
 			if hasUDP {
 				cur, _ := udpsock.ReadCounters()
 				d := cur.Sub(prevUDP)
@@ -535,10 +677,23 @@ func (r *recorder) summary(w io.Writer, elapsed time.Duration) {
 	total := r.requests.Load()
 	fmt.Fprintf(w, "\n=== blast summary =========================================\n")
 	fmt.Fprintf(w, "duration        %s\n", elapsed.Round(time.Millisecond))
-	fmt.Fprintf(w, "requests        %d (%.1f/s)\n", total, float64(total)/elapsed.Seconds())
+	sec := elapsed.Seconds()
+	if sec <= 0 {
+		sec = 1
+	}
+	fmt.Fprintf(w, "requests        %d (%.1f/s completed)\n", total, float64(total)/sec)
+	if offered := r.offered.Load(); offered > 0 {
+		fmt.Fprintf(w, "offered         %d (%.1f/s)\n", offered, float64(offered)/sec)
+	}
 	fmt.Fprintf(w, "failures        %d\n", r.failures.Load())
 	if n := r.abandoned.Load(); n > 0 {
 		fmt.Fprintf(w, "abandoned       %d (still in flight when the run ended)\n", n)
+	}
+	if n := r.omitted.Load(); n > 0 {
+		fmt.Fprintf(w, "omitted         %d (open-loop ticks dropped: max-inflight full)\n", n)
+	}
+	if n := r.bytes.Load(); n > 0 {
+		fmt.Fprintf(w, "bytes           %d (%.1f KB/s)\n", n, float64(n)/sec/1024)
 	}
 	fmt.Fprintf(w, "conn drops      %d\n", r.connDrops)
 
@@ -546,7 +701,7 @@ func (r *recorder) summary(w io.Writer, elapsed time.Duration) {
 	writeProtoSummary(w, r.protos)
 	writeCFCodeSummary(w, r.cfCodes)
 	writeStringHistogram(w, "disconnect / failure reasons", r.kinds)
-	writeLatencySummary(w, r.latencies)
+	writeLatencySummary(w, r.lat)
 	fmt.Fprintf(w, "===========================================================\n")
 }
 
@@ -614,12 +769,15 @@ func writeCFCodeSummary(w io.Writer, cfCodes map[int]int) {
 	}
 }
 
-func writeLatencySummary(w io.Writer, latencies []time.Duration) {
-	if len(latencies) == 0 {
+func writeLatencySummary(w io.Writer, hist *latencyHist) {
+	if hist == nil || hist.len() == 0 {
 		return
 	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	latencies := hist.sorted()
 	fmt.Fprintf(w, "\nlatency (successful requests)\n")
+	if hist.seen > len(latencies) {
+		fmt.Fprintf(w, "  (percentiles from last %d of %d samples)\n", len(latencies), hist.seen)
+	}
 	for _, p := range []float64{50, 90, 99, 99.9} {
 		fmt.Fprintf(w, "  p%-5.4g %s\n", p, percentile(latencies, p).Round(time.Millisecond))
 	}
