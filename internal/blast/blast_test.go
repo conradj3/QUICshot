@@ -81,4 +81,58 @@ func TestCFMeaning(t *testing.T) {
 	}
 }
 
+func TestConfigValidateOpenMode(t *testing.T) {
+	cfg := config{target: "https://edge:8443/fast", conns: 1, workers: 1, mode: "open", rps: 0}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("open mode without rps succeeded")
+	}
+	cfg.rps = 10
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("open mode with rps: %v", err)
+	}
+	cfg.mode = "banana"
+	if err := cfg.validate(); err == nil {
+		t.Fatal("bogus mode succeeded")
+	}
+}
+
+func TestReqSpecNextURLRoundRobin(t *testing.T) {
+	s := &reqSpec{urls: []string{"https://a/fast", "https://a/bytes"}}
+	if got := s.nextURL(); got != "https://a/fast" {
+		t.Fatalf("first = %s", got)
+	}
+	if got := s.nextURL(); got != "https://a/bytes" {
+		t.Fatalf("second = %s", got)
+	}
+	if got := s.nextURL(); got != "https://a/fast" {
+		t.Fatalf("third = %s", got)
+	}
+}
+
+func TestLatencyHistCaps(t *testing.T) {
+	h := newLatencyHist(3)
+	for i := 1; i <= 5; i++ {
+		h.add(time.Duration(i) * time.Millisecond)
+	}
+	if h.len() != 3 {
+		t.Fatalf("len = %d, want 3", h.len())
+	}
+	if h.seen != 5 {
+		t.Fatalf("seen = %d, want 5", h.seen)
+	}
+}
+
+func TestLoadPayloadURLsAndBody(t *testing.T) {
+	cfg := config{target: "https://edge:8443/fast", urls: "https://edge:8443/bytes, https://edge:8443/echo", bodyStr: "hi"}
+	if err := cfg.loadPayload(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.targets) != 3 {
+		t.Fatalf("targets = %#v", cfg.targets)
+	}
+	if string(cfg.body) != "hi" {
+		t.Fatalf("body = %q", cfg.body)
+	}
+}
+
 const statusOriginTimeoutForTest = 524
