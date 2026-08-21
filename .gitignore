@@ -1,0 +1,14 @@
+/.DS_Store
+*.log
+*.test
+coverage.out
+
+/certs/
+/dist/
+/out/
+/tmp/
+/quicshot
+
+/logs/*.jsonl
+/logs/*.pcap
+/logs/qlog/
